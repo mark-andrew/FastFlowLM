@@ -4,6 +4,7 @@
 #include "chat/chat_parser.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <initializer_list>
 #include <set>
 #include <vector>
@@ -216,6 +217,314 @@ void add_call(std::vector<chat_tool_call>& calls, const std::string& name, const
     call.name = name;
     call.arguments = arguments;
     calls.push_back(std::move(call));
+}
+
+std::string lower_ascii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return text;
+}
+
+bool matches_json_schema(const json& value, const json& schema, size_t depth = 0) {
+    if (depth > 32 || !schema.is_object()) return false;
+    if (schema.contains("const") && value != schema["const"]) return false;
+    if (schema.contains("enum")) {
+        if (!schema["enum"].is_array() ||
+            std::find(schema["enum"].begin(), schema["enum"].end(), value) == schema["enum"].end()) {
+            return false;
+        }
+    }
+    for (const char* key : {"anyOf", "oneOf"}) {
+        if (!schema.contains(key)) continue;
+        if (!schema[key].is_array() ||
+            std::none_of(schema[key].begin(), schema[key].end(),
+                         [&](const json& option) { return matches_json_schema(value, option, depth + 1); })) {
+            return false;
+        }
+    }
+    if (schema.contains("allOf")) {
+        if (!schema["allOf"].is_array() ||
+            !std::all_of(schema["allOf"].begin(), schema["allOf"].end(),
+                         [&](const json& option) { return matches_json_schema(value, option, depth + 1); })) {
+            return false;
+        }
+    }
+
+    const json type = schema.value("type", json());
+    if (type.is_array()) {
+        if (std::none_of(type.begin(), type.end(), [&](const json& option) {
+                return option.is_string() &&
+                       matches_json_schema(value, json{{"type", option}}, depth + 1);
+            })) {
+            return false;
+        }
+    } else if (type.is_string()) {
+        const std::string kind = type.get<std::string>();
+        if (kind == "object" && !value.is_object()) return false;
+        if (kind == "array" && !value.is_array()) return false;
+        if (kind == "string" && !value.is_string()) return false;
+        if (kind == "integer" && !value.is_number_integer()) return false;
+        if (kind == "number" && !value.is_number()) return false;
+        if (kind == "boolean" && !value.is_boolean()) return false;
+        if (kind == "null" && !value.is_null()) return false;
+    }
+
+    if (value.is_object()) {
+        const json properties = schema.value("properties", json::object());
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (properties.is_object() && properties.contains(it.key())) {
+                if (!matches_json_schema(it.value(), properties[it.key()], depth + 1)) return false;
+                continue;
+            }
+            if (!schema.contains("additionalProperties")) continue;
+            const json& additional = schema["additionalProperties"];
+            if (additional.is_boolean() && !additional.get<bool>()) return false;
+            if (additional.is_object() && !matches_json_schema(it.value(), additional, depth + 1)) {
+                return false;
+            }
+        }
+        const json required = schema.value("required", json::array());
+        if (required.is_array()) {
+            for (const auto& field : required) {
+                if (field.is_string() && !value.contains(field.get<std::string>())) return false;
+            }
+        }
+    }
+    if (value.is_array() && schema.contains("items")) {
+        for (const auto& item : value) {
+            if (!matches_json_schema(item, schema["items"], depth + 1)) return false;
+        }
+    }
+    return true;
+}
+
+bool has_word(const std::string& text, const std::string& word) {
+    size_t at = text.find(word);
+    while (at != npos) {
+        const bool left = at == 0 || !std::isalnum(static_cast<unsigned char>(text[at - 1]));
+        const size_t end = at + word.size();
+        const bool right = end >= text.size() || !std::isalnum(static_cast<unsigned char>(text[end]));
+        if (left && right) return true;
+        at = text.find(word, at + 1);
+    }
+    return false;
+}
+
+bool has_tool_intent(const std::string& reasoning, const std::string& name) {
+    const std::string text = lower_ascii(reasoning);
+    const std::string tool = lower_ascii(name);
+    size_t at = text.find(tool);
+    while (at != npos) {
+        const size_t begin = at > 96 ? at - 96 : 0;
+        const size_t end = std::min(text.size(), at + tool.size() + 192);
+        const std::string nearby = text.substr(begin, end - begin);
+        for (const std::string& verb : {"call", "invoke", "use"}) {
+            if (!has_word(nearby, verb)) continue;
+            const size_t action = nearby.find(verb);
+            const std::string before = nearby.substr(action > 24 ? action - 24 : 0, action);
+            if (!has_word(before, "not") && before.find("n't") == npos &&
+                !has_word(before, "never") && !has_word(before, "without")) {
+                return true;
+            }
+        }
+        at = text.find(tool, at + tool.size());
+    }
+    return false;
+}
+
+/// \brief A tool call candidate extracted from JSON the model wrote in final text
+struct json_call_candidate {
+    std::string name;   // non-empty when the JSON names a tool explicitly
+    json arguments;     // the arguments object, null when none was found
+};
+
+/// \brief Pull a tool name from a call-like JSON object
+/// \note "type" is accepted as a name except for the OpenAI wrapper value "function".
+std::string json_call_name(const json& object) {
+    if (!object.is_object()) return "";
+    for (const char* key : {"name", "action", "tool", "function"}) {
+        if (object.contains(key) && object[key].is_string()) {
+            return object[key].get<std::string>();
+        }
+    }
+    if (object.contains("type") && object["type"].is_string()) {
+        const std::string type = object["type"].get<std::string>();
+        if (type != "function") return type;
+    }
+    return "";
+}
+
+/// \brief Pull a call\s arguments from a JSON object
+json json_call_arguments(const json& object) {
+    if (!object.is_object()) return json();
+    for (const char* key : {"arguments", "args", "parameters", "input"}) {
+        if (!object.contains(key)) continue;
+        json value = object[key];
+        if (value.is_string()) {
+            try {
+                value = json::parse(value.get<std::string>());
+            } catch (const json::exception&) {
+                continue;
+            }
+        }
+        if (value.is_object()) return value;
+    }
+    return json();
+}
+
+/// \brief Extract a call from JSON, unwrapping the envelopes GPT-OSS writes in final text
+/// \note A name in the JSON is sufficient evidence of intent; a bare arguments object
+///       is left nameless so the caller can require intent from the reasoning.
+json_call_candidate json_call_from_value(const json& value, int depth = 0) {
+    json_call_candidate out;
+    if (depth > 4 || !value.is_object()) return out;
+
+    const std::string name = json_call_name(value);
+    const json args = json_call_arguments(value);
+    if (!name.empty() && !args.is_null()) {
+        out.name = name;
+        out.arguments = args;
+        return out;
+    }
+
+    // OpenAI wrapper: {"type":"function","function":{"name":..,"arguments":..}}
+    if (value.contains("function") && value["function"].is_object()) {
+        return json_call_from_value(value["function"], depth + 1);
+    }
+
+    // Envelope arrays: commentary / tool_calls / calls
+    for (const char* key : {"commentary", "tool_calls", "calls"}) {
+        if (!value.contains(key)) continue;
+        const json& inner = value[key];
+        if (inner.is_array()) {
+            json_call_candidate found;
+            for (const auto& item : inner) {
+                const json_call_candidate cand = json_call_from_value(item, depth + 1);
+                if (cand.name.empty()) continue;
+                if (!found.name.empty() && found.name != cand.name) return json_call_candidate(); // ambiguous
+                found = cand;
+            }
+            if (!found.name.empty()) return found;
+        } else if (inner.is_object()) {
+            return json_call_from_value(inner, depth + 1);
+        }
+    }
+
+    // functions map: {"functions": {"toolname": {args}}}
+    if (value.contains("functions") && value["functions"].is_object()) {
+        const json& fns = value["functions"];
+        if (fns.size() == 1) {
+            for (auto it = fns.begin(); it != fns.end(); ++it) {
+                json a = it.value();
+                if (a.is_string()) {
+                    try {
+                        a = json::parse(a.get<std::string>());
+                    } catch (const json::exception&) {
+                        return out;
+                    }
+                }
+                if (a.is_object()) {
+                    out.name = it.key();
+                    out.arguments = a;
+                    return out;
+                }
+            }
+        }
+    }
+
+    out.arguments = value; // bare arguments object
+    return out;
+}
+
+/// \brief Whether a partial JSON string mentions any supplied tool by name
+/// \note Every quoted fragment is considered, including one still open at the
+///       end of the text, so a tool name that is still streaming is recognised
+///       as soon as its prefix is unambiguous.
+bool partial_json_names_tool(const std::string& text, const json* tools) {
+    if (tools == nullptr || !tools->is_array()) return false;
+
+    std::vector<std::string> fragments;
+    for (size_t at = 0; at < text.size();) {
+        at = text.find('"', at);
+        if (at == npos) break;
+        const size_t begin = at + 1;
+        const size_t end = text.find('"', begin);
+        if (end == npos) {
+            fragments.push_back(text.substr(begin)); // the closing quote has not streamed yet
+            break;
+        }
+        fragments.push_back(text.substr(begin, end - begin));
+        at = end + 1;
+    }
+    if (fragments.empty()) return false;
+
+    for (const auto& tool : *tools) {
+        if (!tool.is_object() || !tool.contains("function") || !tool["function"].is_object()) continue;
+        const json& function = tool["function"];
+        if (!function.contains("name") || !function["name"].is_string()) continue;
+        const std::string& name = function["name"].get<std::string>();
+        for (const auto& fragment : fragments) {
+            if (!fragment.empty() && name.compare(0, fragment.size(), fragment) == 0) return true;
+        }
+    }
+    return false;
+}
+
+
+bool auto_json_tool_call(chat_msg& message, const chat_parse_options& options) {
+    if (!options.auto_tool_choice || !options.parse_tool_calls || !options.tools ||
+        !options.tools->is_array() || options.tools->empty() || message.tool_calls.size() ||
+        message.reasoning.empty() || message.content.empty()) {
+        return false;
+    }
+
+    std::string text = trim(message.content);
+    if (starts_with_at(text, 0, "```")) {
+        const size_t first_line = text.find('\n');
+        const size_t closing = text.rfind("```");
+        if (first_line == npos || closing == npos || closing <= first_line) return false;
+        text = trim(text.substr(first_line + 1, closing - first_line - 1));
+    }
+
+    json output;
+    try {
+        output = json::parse(text);
+    } catch (const json::exception&) {
+        return false;
+    }
+    if (!output.is_object()) return false;
+
+    const json_call_candidate candidate = json_call_from_value(output);
+    const std::string& requested_name = candidate.name;
+    const json& arguments = candidate.arguments;
+    if (arguments.is_null() || !arguments.is_object()) return false;
+
+    std::string matched_name;
+    const json* matched_function = nullptr;
+    for (const auto& tool : *options.tools) {
+        if (!tool.is_object() || !tool.contains("function") || !tool["function"].is_object()) continue;
+        const json& function = tool["function"];
+        if (!function.contains("name") || !function["name"].is_string()) continue;
+        const std::string name = function["name"].get<std::string>();
+        if (!requested_name.empty()) {
+            // the JSON names the tool explicitly; that is sufficient evidence of intent
+            if (requested_name != name) continue;
+        } else if (!has_tool_intent(message.reasoning, name)) {
+            continue;
+        }
+        if (!matched_name.empty()) return false; // the model did not pick one function unambiguously
+        matched_name = name;
+        matched_function = &function;
+    }
+    if (matched_function == nullptr || !matched_function->contains("parameters") ||
+        !matches_json_schema(arguments, (*matched_function)["parameters"])) {
+        return false;
+    }
+
+    add_call(message.tool_calls, matched_name, arguments.dump());
+    message.content.clear();
+    return true;
 }
 
 // ---------------------------------------------------------------- hermes json
@@ -843,7 +1152,16 @@ chat_msg parse_harmony(const std::string& text, bool is_partial, const chat_pars
             body = cut_partial_marker(body, {&HARMONY_END, &HARMONY_CALL, &HARMONY_RETURN, &HARMONY_START});
         }
 
-        if (header.recipient.compare(0, HARMONY_FUNCTIONS.size(), HARMONY_FUNCTIONS) == 0) {
+        const bool function_recipient =
+            header.recipient.compare(0, HARMONY_FUNCTIONS.size(), HARMONY_FUNCTIONS) == 0;
+        // The engine may stop at <|call|>, <|end|>, or <|return|>, and can leave the
+        // marker out of the text entirely. What identifies a call is its header:
+        // a functions.* recipient in the commentary channel.
+        const bool valid_tool_call = function_recipient && header.channel == "commentary" &&
+                                     (body_closed || !is_partial);
+        const bool pending_tool_call = function_recipient && header.channel == "commentary" &&
+                                       !body_closed && is_partial;
+        if (valid_tool_call) {
             if (options.parse_tool_calls) {
                 std::string args = trim(body);
                 if (args.empty() && (body_closed || !is_partial)) {
@@ -851,6 +1169,9 @@ chat_msg parse_harmony(const std::string& text, bool is_partial, const chat_pars
                 }
                 add_call(msg.tool_calls, header.recipient.substr(HARMONY_FUNCTIONS.size()), args);
             }
+        } else if (pending_tool_call) {
+            // Hold the body until its <|call|> terminator confirms it is a tool call.
+            break;
         } else if (header.channel == "analysis") {
             reasoning.add(body);
         } else {
@@ -874,6 +1195,23 @@ chat_msg parse_harmony(const std::string& text, bool is_partial, const chat_pars
 
     msg.reasoning = reasoning.join();
     msg.content = content.join();
+    if (is_partial && options.auto_tool_choice && options.tools && !msg.content.empty()) {
+        const std::string candidate = trim(msg.content);
+        const bool json_candidate = starts_with_at(candidate, 0, "{") || starts_with_at(candidate, 0, "```");
+        const bool has_intent = std::any_of(options.tools->begin(), options.tools->end(), [&](const json& tool) {
+            if (!tool.is_object() || !tool.contains("function") || !tool["function"].is_object()) return false;
+            const json& function = tool["function"];
+            return function.contains("name") && function["name"].is_string() &&
+                   has_tool_intent(msg.reasoning, function["name"].get<std::string>());
+        });
+        const bool names_tool = partial_json_names_tool(candidate, options.tools);
+        if (json_candidate && (has_intent || names_tool)) {
+            msg.content.clear(); // hold JSON arguments until they can be classified as a call or an answer
+        }
+    }
+    if (!is_partial) {
+        auto_json_tool_call(msg, options);
+    }
     return msg;
 }
 

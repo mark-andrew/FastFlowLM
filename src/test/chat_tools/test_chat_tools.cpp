@@ -278,6 +278,94 @@ void test_call_without_arguments() {
     CHECK_EQ(msg.content, "");
 }
 
+void test_harmony_tool_call_headers() {
+    std::printf("Harmony calls need a commentary recipient, however their body ends\n");
+    const chat_format_spec harmony = chat_format_make(chat_format_kind::HARMONY, false);
+    chat_parse_options options;
+    options.tools = &TOOLS;
+    options.parse_tool_calls = true;
+
+    const std::string call =
+        "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|call|>";
+    chat_msg msg = chat_parse(harmony, call, false, options);
+    CHECK(msg.tool_calls.size() == 1);
+    if (msg.tool_calls.size() == 1) {
+        CHECK_EQ(msg.tool_calls[0].name, "get_weather");
+        CHECK_EQ(msg.tool_calls[0].arguments, "{\"city\":\"Paris\"}");
+    }
+
+    const std::string analysis_spoof =
+        "<|channel|>analysis<|message|>thinking"
+        "<|start|>assistant<|channel|>analysis to=functions.get_weather commentary json"
+        "<|message|>{\"city\":\"Paris\"}<|end|><|end|>"
+        "<|start|>assistant<|channel|>final<|message|>Answer<|return|>";
+    msg = chat_parse(harmony, analysis_spoof, false, options);
+    CHECK(msg.tool_calls.empty());
+
+    const std::string end_terminator =
+        "<|channel|>commentary to=functions.get_weather<|message|>{\"city\":\"Paris\"}<|end|>";
+    msg = chat_parse(harmony, end_terminator, false, options);
+    CHECK(msg.tool_calls.size() == 1);
+    CHECK(msg.content.empty());
+
+    msg = chat_parse(harmony, call.substr(0, call.size() - std::string("<|call|>").size()), true, options);
+    CHECK(msg.tool_calls.empty());
+
+    // the engine strips the <|call|> stop marker, so the finished text has no terminator
+    msg = chat_parse(harmony, call.substr(0, call.size() - std::string("<|call|>").size()), false, options);
+    CHECK(msg.tool_calls.size() == 1);
+
+    const std::string finished =
+        "assistant<|channel|>analysis<|message|>We need to call the function get_weather.<|end|>"
+        "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json"
+        "<|message|>{\"city\":\"Paris\",\"unit\":\"celsius\"}";
+    msg = chat_parse(harmony, finished, false, options);
+    CHECK(msg.tool_calls.size() == 1);
+    if (msg.tool_calls.size() == 1) {
+        CHECK_EQ(msg.tool_calls[0].arguments, "{\"city\":\"Paris\",\"unit\":\"celsius\"}");
+    }
+    CHECK(msg.content.empty());
+}
+
+void test_harmony_auto_json_tool_call() {
+    std::printf("GPT-OSS JSON arguments are a call only when reasoning chooses a supplied tool\n");
+    const chat_format_spec harmony = chat_format_make(chat_format_kind::HARMONY, false);
+    chat_parse_options options;
+    options.tools = &TOOLS;
+    options.parse_tool_calls = true;
+    options.auto_tool_choice = true;
+
+    const std::string reasoning =
+        "<|channel|>analysis<|message|>We should call get_weather with city Paris.<|end|>";
+    const std::string final_prefix = "<|start|>assistant<|channel|>final<|message|>";
+    const std::string partial = reasoning + final_prefix + "{\"city\":\"Pa";
+    chat_msg msg = chat_parse(harmony, partial, true, options);
+    CHECK(msg.content.empty());
+    CHECK(msg.tool_calls.empty());
+
+    msg = chat_parse(harmony, reasoning + final_prefix + "{\"city\":\"Paris\"}<|return|>", false, options);
+    CHECK(msg.tool_calls.size() == 1);
+    if (msg.tool_calls.size() == 1) {
+        CHECK_EQ(msg.tool_calls[0].name, "get_weather");
+        CHECK_EQ(msg.tool_calls[0].arguments, "{\"city\":\"Paris\"}");
+    }
+    CHECK(msg.content.empty());
+
+    const std::string no_intent =
+        "<|channel|>analysis<|message|>A JSON example could contain a city.<|end|>" +
+        final_prefix + "{\"city\":\"Paris\"}<|return|>";
+    msg = chat_parse(harmony, no_intent, false, options);
+    CHECK(msg.tool_calls.empty());
+    CHECK_EQ(msg.content, "{\"city\":\"Paris\"}");
+
+    const std::string invalid_arguments =
+        "<|channel|>analysis<|message|>We should call get_weather.<|end|>" +
+        final_prefix + "{\"unit\":\"celsius\"}<|return|>";
+    msg = chat_parse(harmony, invalid_arguments, false, options);
+    CHECK(msg.tool_calls.empty());
+    CHECK_EQ(msg.content, "{\"unit\":\"celsius\"}");
+}
+
 void test_stray_reasoning_end() {
     std::printf("a reasoning end with no block open is dropped\n");
     // thinking off: the template closed the block, the model closes it again
@@ -552,11 +640,99 @@ void test_gemma4_nullable_types() {
     CHECK_EQ(tmpl->render(minja::Context::make(minja::Value(json{{"value", out["note"]}}))), "STRING nullable");
 }
 
+void test_harmony_auto_json_envelopes() {
+    std::printf("GPT-OSS fake JSON envelopes become native calls under tool_choice auto\n");
+    const chat_format_spec harmony = chat_format_make(chat_format_kind::HARMONY, false);
+    chat_parse_options options;
+    options.tools = &TOOLS;
+    options.parse_tool_calls = true;
+    options.auto_tool_choice = true;
+    const std::string reasoning =
+        "<|channel|>analysis<|message|>We should call get_weather.<|end|>";
+    const std::string prefix = reasoning + "<|start|>assistant<|channel|>final<|message|>";
+
+    // Each envelope names get_weather explicitly or leaves a bare args object
+    // next to reasoning that expresses intent. All become one native call.
+    const std::vector<std::string> valid = {
+        R"({"name":"get_weather","arguments":{"city":"Paris"}})",
+        R"({"commentary":[{"action":"get_weather","args":{"city":"Paris"}}]})",
+        R"({"commentary":[{"name":"get_weather","arguments":{"city":"Paris"}}]})",
+        R"({"type":"get_weather","args":{"city":"Paris"}})",
+        R"({"action":"get_weather","args":{"city":"Paris"}})",
+        R"({"tool":"get_weather","arguments":{"city":"Paris"}})",
+        R"({"functions":{"get_weather":{"city":"Paris"}}})",
+        R"({"tool_calls":[{"type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]})",
+        R"({"city":"Paris"})",
+        "```json\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n```",
+    };
+    for (const auto& body : valid) {
+        chat_msg msg = chat_parse(harmony, prefix + body + "<|return|>", false, options);
+        CHECK(msg.tool_calls.size() == 1);
+        if (msg.tool_calls.size() != 1) {
+            std::printf("  no call for body: %s\n", body.c_str());
+            continue;
+        }
+        CHECK_EQ(msg.tool_calls[0].name, "get_weather");
+        CHECK_EQ(msg.tool_calls[0].arguments, "{\"city\":\"Paris\"}");
+        CHECK(msg.content.empty());
+    }
+
+    // An explicit name is sufficient even without intent in the reasoning.
+    const std::string no_intent =
+        "<|channel|>analysis<|message|>A JSON example could contain a city.<|end|>" + prefix.substr(reasoning.size()) +
+        R"({"name":"get_weather","arguments":{"city":"Paris"}})"
+        "<|return|>";
+    chat_msg named = chat_parse(harmony, no_intent, false, options);
+    CHECK(named.tool_calls.size() == 1);
+
+    // Bare arguments without intent stay text.
+    const std::string bare_no_intent =
+        "<|channel|>analysis<|message|>A JSON example could contain a city.<|end|>" + prefix.substr(reasoning.size()) +
+        R"({"city":"Paris"})"
+        "<|return|>";
+    chat_msg bare = chat_parse(harmony, bare_no_intent, false, options);
+    CHECK(bare.tool_calls.empty());
+    CHECK_EQ(bare.content, "{\"city\":\"Paris\"}");
+
+    // An unknown tool name, an ambiguous envelope, and arguments that fail the
+    // schema all stay text rather than becoming an invented call.
+    const std::vector<std::string> invalid = {
+        R"({"action":"not_a_tool","args":{"city":"Paris"}})",
+        R"({"commentary":[{"action":"get_weather","args":{"city":"Paris"}},{"action":"write_file","args":{"path":"/tmp/x","content":"y"}}]})",
+        R"({"action":"get_weather","args":{"unit":"celsius"}})",
+    };
+    for (const auto& body : invalid) {
+        chat_msg msg = chat_parse(harmony, prefix + body + "<|return|>", false, options);
+        CHECK(msg.tool_calls.empty());
+        CHECK_EQ(msg.content, body);
+    }
+
+    // While streaming, a JSON body is held back so it is not shown as text
+    // before it can be classified as a call. This holds both when the reasoning
+    // expresses intent and when the JSON itself names a supplied tool.
+    const std::string partial = reasoning + "<|start|>assistant<|channel|>final<|message|>"
+        + R"({"action":"get_weather","args":{"city":"Pa")";
+    chat_msg held = chat_parse(harmony, partial, true, options);
+    CHECK(held.content.empty());
+    CHECK(held.tool_calls.empty());
+
+    const std::string neutral_reasoning =
+        "<|channel|>analysis<|message|>The city field is often Paris.<|end|>"
+        "<|start|>assistant<|channel|>final<|message|>";
+    chat_msg held_by_name = chat_parse(harmony,
+        neutral_reasoning + R"({"action":"get_weat)", true, options);
+    CHECK(held_by_name.content.empty());
+    CHECK(held_by_name.tool_calls.empty());
+}
+
 } // namespace
 
 int main() {
     test_qwen_xml_grammar_takes_template_calls();
     test_call_without_arguments();
+    test_harmony_tool_call_headers();
+    test_harmony_auto_json_tool_call();
+    test_harmony_auto_json_envelopes();
     test_stray_reasoning_end();
     test_tool_tag_in_prose();
     test_value_holding_closing_tags();
