@@ -9,7 +9,7 @@ parent: Models
 
 - **Type:** Text-to-Text
 - **Think:** Low / Medium / High (reasoning effort)
-- **Tool Calling Support:** No 
+- **Tool Calling Support:** Partial — forced/required calls work; automatic tool selection is unreliable
 - **Prefix cache (server mode):** Yes, saved prompts are reused (see [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/))
 - **Base Model:** [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b)
 - **Quantization:** Q4_1

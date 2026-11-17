@@ -82,6 +82,54 @@ def auto_stream(api: Api) -> None:
 
 
 @case
+def gpt_oss_auto_calls_tool(api: Api) -> None:
+    """GPT-OSS uses available function tools for a relevant request."""
+    if api.model != "gpt-oss:20b":
+        raise Skip("GPT-OSS-specific tool-template regression test")
+    choice = api.ok(api.body(
+        user("Tell me the current weather in Paris. Use the available tools if they can answer."),
+        tools=WEATHER_TOOLS,
+        max_tokens=2048,
+    ))
+    calls = expect_calls(choice, WEATHER_TOOLS)
+    expect(calls[0]["function"]["name"] == "get_weather",
+           f"expected get_weather, got {calls[0]['function']['name']!r}")
+
+
+@case
+def gpt_oss_auto_stream_calls_tool(api: Api) -> None:
+    """GPT-OSS JSON tool arguments are converted in the streaming path too."""
+    if api.model != "gpt-oss:20b":
+        raise Skip("GPT-OSS-specific tool-template regression test")
+    body = api.body(
+        user("Tell me the current weather in Paris. Use the available tools if they can answer."),
+        tools=WEATHER_TOOLS,
+        max_tokens=2048,
+    )
+    folded = flm_api.check_stream_contract(api.ok_stream(body), include_usage=False)
+    calls = folded.tool_calls
+    expect(len(calls) >= 1, f"expected a tool call, got {calls}")
+    flm_api.check_tool_calls(calls, WEATHER_TOOLS)
+    expect(calls[0]["function"]["name"] == "get_weather",
+           f"expected get_weather, got {calls[0]['function']['name']!r}")
+
+
+@case
+def gpt_oss_auto_skips_irrelevant_tool(api: Api) -> None:
+    """GPT-OSS answers unrelated questions instead of calling a tool just because one is available."""
+    if api.model != "gpt-oss:20b":
+        raise Skip("GPT-OSS-specific tool-template regression test")
+    choice = api.ok(api.body(
+        user("Tell me a joke about cats."),
+        tools=WEATHER_TOOLS,
+        max_tokens=1024,
+    ))
+    msg = flm_api.check_message_contract(choice)
+    expect(not msg.get("tool_calls"), f"an unrelated request called a tool: {msg}")
+    expect(msg["content"], "the assistant returned no answer")
+
+
+@case
 def no_tools_no_calls(api: Api) -> None:
     """Without tools in the request nothing is parsed as a tool call."""
     msg = flm_api.check_message_contract(api.ok(api.body(user(WEATHER_PROMPT), max_tokens=96)))

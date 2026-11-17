@@ -63,6 +63,7 @@ void test_same_size_image_again() {
     const auto plan = plan_prompt_reuse(prompt, prompt, media);
     CHECK(plan.clear && plan.skip == 0);
     CHECK(plan.skipped_media[prompt_media_t::kImage] == 0);   // keep the image: it is prefilled again
+    CHECK(plan.media_begin == 2);
     CHECK(plan.media_end == 2 + 4);
 }
 
@@ -84,7 +85,30 @@ void test_follow_up_turn() {
     const auto plan_b = plan_prompt_reuse(turn1, turn2b, media_b);
     CHECK(plan_b.skip == turn1.size());
     CHECK(plan_b.skipped_media[prompt_media_t::kImage] == 1);
+    CHECK(plan_b.media_begin == 1);
     CHECK(plan_b.media_end == 3);
+}
+
+void test_late_media_prefill_chunks() {
+    std::printf("late image payload stays in its own bounded prefill chunk\n");
+    const auto chunks = plan_prefill_chunks(83021, 8192, 82000, 83021);
+    CHECK(chunks.size() == 11);
+    CHECK(chunks.front().begin == 0 && chunks.front().end == 8192 && !chunks.front().carries_media);
+    CHECK(chunks[9].begin == 73728 && chunks[9].end == 81920 && !chunks[9].carries_media);
+    CHECK(chunks.back().begin == 81920 && chunks.back().end == 83021 && chunks.back().carries_media);
+
+    size_t media_chunks = 0;
+    for (const auto& chunk : chunks) media_chunks += chunk.carries_media ? 1 : 0;
+    CHECK(media_chunks == 1);
+}
+
+void test_media_span_crossing_chunk_boundary() {
+    std::printf("a media span crossing a chunk boundary is kept together\n");
+    const auto chunks = plan_prefill_chunks(20000, 8192, 8000, 9000);
+    CHECK(chunks.size() == 3);
+    CHECK(chunks[0].begin == 0 && chunks[0].end == 9000 && chunks[0].carries_media);
+    CHECK(chunks[1].begin == 9000 && chunks[1].end == 17192 && !chunks[1].carries_media);
+    CHECK(chunks[2].begin == 17192 && chunks[2].end == 20000 && !chunks[2].carries_media);
 }
 
 void test_diverged_keeps_everything() {
@@ -205,6 +229,8 @@ int main() {
     test_text_only();
     test_same_size_image_again();
     test_follow_up_turn();
+    test_late_media_prefill_chunks();
+    test_media_span_crossing_chunk_boundary();
     test_diverged_keeps_everything();
     test_inside_image();
     test_counts();

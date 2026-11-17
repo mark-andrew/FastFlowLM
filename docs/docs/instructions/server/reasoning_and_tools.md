@@ -9,7 +9,7 @@ parent: Local Server (Server Mode)
 
 Every model writes its answer in its own markup. Qwen3 wraps its thinking in `<think>…</think>` and tool calls in `<tool_call>…</tool_call>`. Gemma4 thinks in a `<|channel>thought` channel and writes calls as `call:f{…}`. gpt-oss uses Harmony channels. LFM2 writes Python calls.
 
-FLM's `/v1/chat/completions` endpoint removes that markup for you. Whatever the model, you get the same OpenAI-shaped message:
+FLM's `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` endpoints remove that markup for you. They return OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages formats, respectively. Reasoning and tool calls are parsed from the model's native format.
 
 | Field | What it holds |
 |---|---|
@@ -393,7 +393,7 @@ Answer **every** call with its own `tool` message before the next request. To ge
 - **Text and calls can interleave.** A model may write a sentence, call a tool, then write more. Both parts are returned: the text pieces are joined in `content` and the calls are in `tool_calls`. When separate text pieces are joined, they're separated by a blank line (`\n\n`).
 - **Whitespace at the edges is trimmed.** `content` and `reasoning_content` never start or end with blank lines. While streaming, trailing whitespace is held back until more text follows it.
 - **Text after the model hands over to a tool is dropped.** Gemma4 marks the end of its turn with `<|tool_response>`, and gpt-oss with `<|call|>`. Generation stops there.
-- **Only `/v1/chat/completions` does this parsing.** `/v1/completions` returns the raw text.
+- **`/v1/chat/completions` and `/v1/responses` do this parsing.** `/v1/completions` returns the raw text.
 
 ---
 

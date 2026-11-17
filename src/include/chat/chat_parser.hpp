@@ -6,6 +6,8 @@
 ///       prefix of what the full parse yields:
 ///         - a marker that may still be forming at the end of the text is held
 ///           back instead of being shown as text,
+///         - GPT-OSS auto-tool JSON is held until the parser can confirm the
+///           model intended a tool call,
 ///         - reasoning and content are trimmed, so trailing whitespace waits
 ///           until something follows it,
 ///         - a tool call appears once its name is complete, its arguments grow
@@ -26,6 +28,8 @@ struct chat_parse_options {
     const nlohmann::ordered_json* tools = nullptr;
     /// \brief extract tool calls; when false the tool markup stays in the content
     bool parse_tool_calls = true;
+    /// \brief GPT-OSS may spell an intended tool call as its JSON arguments in final text
+    bool auto_tool_choice = false;
     /// \brief keep the whitespace around the output's first text, as it was written
     /// \note For continue_final_message: the output continues text the client
     ///       already holds, so its whitespace (" yes" after "The answer is:", or a

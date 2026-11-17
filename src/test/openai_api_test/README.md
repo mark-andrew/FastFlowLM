@@ -1,6 +1,6 @@
 # OpenAI API tests
 
-Live tests for `/v1/chat/completions`: output parsing (reasoning, content, tool calls), streaming, and constrained decoding (`tool_choice`, `parallel_tool_calls`, `response_format`). They drive a FastFlowLM server that is already running and need only the Python 3 standard library.
+Live tests for `/v1/chat/completions` and `/v1/responses`: output parsing (reasoning, content, tool calls), streaming, constrained decoding (`tool_choice`, `parallel_tool_calls`, `response_format`), and stateless Responses tool round trips. They drive a FastFlowLM server that is already running and need only the Python 3 standard library.
 
 User docs for what's tested here:
 

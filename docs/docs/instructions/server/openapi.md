@@ -55,8 +55,99 @@ The following endpoints are actively supported and maintained:
 
 - `v1/models`
 - `v1/chat/completions`
+- `v1/responses`
+- `v1/messages` (Anthropic Messages API)
 - `v1/audio/transcriptions`
-- `v1/embeddings`
+- [`v1/embeddings`](../../models/embeddinggemma.md)
+
+## OpenAI Responses API
+
+FastFlowLM also exposes `POST /v1/responses`. It adapts stateless Responses requests to the
+same chat engine used by `/v1/chat/completions`, including function tools and streamed output.
+The existing Chat Completions endpoint and its response format are unchanged.
+
+Function tools use the Responses shape (`name`, `description`, and `parameters` at the top
+level). A tool result can be sent on the next request as a `function_call_output` input item.
+Because FastFlowLM does not retain Responses objects between requests, send the full input
+history on each turn; `previous_response_id` and `conversation` are not supported. Built-in
+remote tools such as web search, code interpreter, and remote MCP are not supported; define
+client-side function tools instead. Tool execution remains the client's responsibility, and
+whether a model chooses or supports tool calls depends on that model's chat format and model
+card.
+
+```bash
+curl http://127.0.0.1:52625/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3:4b",
+    "input": "What is the weather in Paris?",
+    "tools": [{
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }],
+    "tool_choice": "required"
+  }'
+```
+
+Non-streaming responses return function calls as `output` items with `"type": "function_call"`.
+With `"stream": true`, FastFlowLM emits Responses lifecycle events and function-call argument
+deltas as server-sent events.
+
+## Anthropic Messages API
+
+FastFlowLM exposes `POST /v1/messages` for Anthropic Messages API clients, including Claude Code.
+It adapts stateless Anthropic message history to the same chat engine used by the OpenAI-compatible
+endpoints. Function tools (`input_schema`), `tool_choice` (`auto`, `any`, or a named `tool`),
+tool results, streaming events, and inline base64 PNG/JPEG/WebP images are supported. Tool
+execution remains the client's responsibility; send the full conversation history on each call.
+
+Only inline base64 image sources are accepted. Remote image URLs, Anthropic hosted tools, token
+counting, and Anthropic-specific thinking signatures are not implemented. Anthropic `thinking`
+enabled/adaptive/disabled requests map to FLM's `think` switch; prior thinking blocks are not replayed.
+
+```bash
+curl http://127.0.0.1:52625/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: local' \
+  -d '{
+    "model": "qwen3.6-moe:35b-a3b",
+    "max_tokens": 512,
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }],
+    "tool_choice": {"type": "any"}
+  }'
+```
+
+Non-streaming responses use Anthropic `message` objects and represent function calls as `tool_use`
+content blocks. With `"stream": true`, FastFlowLM emits Anthropic `message_start`,
+`content_block_*`, `message_delta`, and `message_stop` server-sent events.
+
+For Claude Code, set `ANTHROPIC_BASE_URL` to the server root (without `/v1`, which Claude Code
+appends) and select the served model:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:52625 \
+ANTHROPIC_API_KEY=local \
+ANTHROPIC_MODEL=qwen3.6-moe:35b-a3b \
+claude
+```
+
+FLM currently does not authenticate API requests; keep the server on a trusted network.
 
 ---
 

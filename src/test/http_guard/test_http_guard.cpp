@@ -59,7 +59,7 @@ void test_engine_routes_take_npu_queue() {
     const std::string src = ss.str();
 
     const std::set<std::string> engine = {"handle_generate", "handle_chat", "handle_embeddings",
-        "handle_openai_chat_completion", "handle_openai_completion", "handle_openai_audio_transcriptions",
+        "handle_openai_chat_completion", "handle_openai_responses", "handle_openai_completion", "handle_openai_audio_transcriptions",
         "handle_systemone"};
     const std::set<std::string> no_engine = {"handle_show", "handle_ps", "handle_models", "handle_models_openai",
         "handle_version", "handle_pull", "handle_systemone_models"};
@@ -257,9 +257,10 @@ void test_required_fields() {
 
     CHECK(is_400_for(validate_embeddings(empty), "model"));
     CHECK(is_400_for(validate_embeddings(ojson{{"model", "m"}}), "input"));
-    CHECK(is_400_for(validate_embeddings(ojson{{"model", "m"}, {"input", 3}}), "input"));
+    CHECK(!validate_embeddings(ojson{{"model", "m"}, {"input", 3}})); // provider-defined input
     CHECK(is_400_for(validate_embeddings(ojson{{"model", "m"}, {"input", ojson::array()}}), "input"));
-    CHECK(is_400_for(validate_embeddings(ojson{{"model", "m"}, {"input", ojson::array({"a", 1})}}), "input"));
+    CHECK(!validate_embeddings(ojson{{"model", "m"}, {"input", ojson::array({"a", 1})}}));
+    CHECK(!validate_embeddings(ojson{{"model", "m"}, {"input", ojson{{"title", "t"}, {"text", "a"}}}}));
     CHECK(!validate_embeddings(ojson{{"model", "m"}, {"input", "a"}}));
     CHECK(!validate_embeddings(ojson{{"model", "m"}, {"input", ojson::array({"a", "b"})}}));
 

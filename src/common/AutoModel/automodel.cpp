@@ -501,7 +501,7 @@ bool AutoModel::_prefix_text_insert(chat_meta_info_t& meta_info, std::vector<int
 bool AutoModel::_prefix_insert(PrefixSlotCache& cache, chat_meta_info_t& meta_info, std::vector<int>& tokens, const std::vector<int>& full_tokens,
                                const std::vector<uint64_t>& image_hashes, size_t match_len, const std::string& boundary_marker,
                                void* payload, int last_image_token_index, std::function<bool()> is_cancelled,
-                               std::optional<int> requested_max_new_tokens) {
+                               std::optional<int> requested_max_new_tokens, int first_image_token_index) {
     bool success = true;
     uint64_t head_prefill_ns = 0;
     // Save the end of system + tools while prefilling, so a prompt that shares only that part
@@ -535,7 +535,8 @@ bool AutoModel::_prefix_insert(PrefixSlotCache& cache, chat_meta_info_t& meta_in
     }
     if (success) {
         success = payload != nullptr
-            ? this->_shared_insert(meta_info, tokens, is_cancelled, payload, last_image_token_index, requested_max_new_tokens)
+            ? this->_shared_insert(meta_info, tokens, is_cancelled, payload, last_image_token_index,
+                                   requested_max_new_tokens, true, first_image_token_index)
             : this->_shared_insert(meta_info, tokens, is_cancelled, nullptr, 0, requested_max_new_tokens);
     }
     if (!success) {
@@ -591,7 +592,9 @@ prompt_reuse_t AutoModel::_plan_reuse(const std::vector<int>& tokens, const std:
     return plan;
 }
 
-bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled, void* payload, int first_len_run, std::optional<int> requested_max_new_tokens, bool sample_next) {
+bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled, void* payload,
+                               int first_len_run, std::optional<int> requested_max_new_tokens, bool sample_next,
+                               int first_payload_token_index) {
     // taken first, so a request that throws below cannot leave it for the next one; a prefill-only head pass
     // (_prefix_insert) leaves the plan to the pass that reads the rest of the prompt
     const std::optional<size_t> planned_skip = sample_next ? std::exchange(this->planned_skip_, std::nullopt) : std::nullopt;
@@ -660,7 +663,7 @@ bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& to
     const std::uint64_t replayed_before = this->backend_ ? this->backend_->replayed_tokens() : 0;
     auto prefill_start_time = this->profiler_list[PREFILL_TIME].start();
     
-    y = _chunked_insert(meta_info, tokens, is_cancelled, payload, first_len_run);
+    y = _chunked_insert(meta_info, tokens, is_cancelled, payload, first_len_run, first_payload_token_index);
 
     auto prefill_end_time = this->profiler_list[PREFILL_TIME].stop(tokens.size());
     meta_info.prefill_duration = (uint64_t)time_utils::duration_ns(prefill_start_time, prefill_end_time).first;
@@ -690,7 +693,9 @@ bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& to
     return true;
 }
 
-buffer<bf16> AutoModel::_chunked_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled, void* payload, int first_len_run) {
+buffer<bf16> AutoModel::_chunked_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens,
+                                        std::function<bool()> is_cancelled, void* payload, int first_len_run,
+                                        int first_payload_token_index) {
     int max_prefill_len = meta_info.max_prefill_len;
     // log2 of a non-positive length is not a number to shift by; an unset or
     // degenerate limit means "no chunking", which the < 512 branch below is
@@ -723,6 +728,30 @@ buffer<bf16> AutoModel::_chunked_insert(chat_meta_info_t& meta_info, std::vector
             return y;
         }
         y = this->lm_engine->prefill(tokens, payload);
+    }
+    else if (payload != nullptr && first_payload_token_index > 0 && first_len_run > first_payload_token_index) {
+        // The media payload must accompany all of its token rows, but it need not
+        // force the text before the media into the same prefill call. This matters
+        // for a new image at the end of a long Qwen3.6 conversation: chunk the
+        // preceding history normally, then pass the payload with the chunk that
+        // contains the image rows.
+        const auto chunks = plan_prefill_chunks(tokens.size(), static_cast<size_t>(max_prefill_len),
+                                                static_cast<size_t>(first_payload_token_index),
+                                                static_cast<size_t>(first_len_run));
+        for (size_t i = 0; i < chunks.size(); i++) {
+            const auto& chunk = chunks[i];
+            std::vector<int> chunk_tokens(tokens.begin() + chunk.begin, tokens.begin() + chunk.end);
+            header_print("FLM", "Prefill chunk " + std::to_string(i + 1) + "/" + std::to_string(chunks.size()) +
+                                    " with " + std::to_string(chunk_tokens.size()) + " tokens");
+            if (is_cancelled()) {
+                meta_info.stop_reason = CANCEL_DETECTED;
+                break;
+            }
+            buffer<bf16> chunk_y = this->lm_engine->prefill(chunk_tokens, chunk.carries_media ? payload : nullptr);
+            if (i + 1 == chunks.size()) {
+                y = std::move(chunk_y);
+            }
+        }
     }
     else{
         if (first_len_run > 0) {

@@ -1087,7 +1087,8 @@ std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader&
             if (!req.body().empty()) {
                 request_json = json::parse(req.body());
             }
-            rest_handler->handle_embeddings(request_json, send_response, send_streaming_response);
+            rest_handler->handle_embeddings(request_json, send_response, send_streaming_response,
+                    [&] { return cancellation_token && cancellation_token->cancelled(); });
         });
     
     server->register_handler("GET", "/api/tags",
@@ -1170,7 +1171,8 @@ std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader&
                 if (!req.body().empty()) {
                     request_json = json::parse(req.body());
                 }
-                rest_handler->handle_embeddings(request_json, send_response, send_streaming_response);
+                rest_handler->handle_embeddings(request_json, send_response, send_streaming_response,
+                    [&] { return cancellation_token && cancellation_token->cancelled(); });
         });
 
     // System One decisions (d3:lite via --decision); /v1/decisions is the alias vLLM Semantic
@@ -1207,7 +1209,34 @@ std::unique_ptr<WebServer> create_lm_server(model_list& models, ModelDownloader&
             }
             rest_handler->handle_openai_chat_completion(request_json, send_response, send_streaming_response, cancellation_token);
         });
-    
+
+    server->register_handler("POST", "/v1/responses",
+        [rest_handler](const http::request<http::string_body>& req,
+                      std::function<void(const json&)> send_response,
+                      std::function<void(const json&, bool)> send_streaming_response,
+                      std::shared_ptr<HttpSession> session,
+                      std::shared_ptr<CancellationToken> cancellation_token) {
+            json request_json;
+            if (!req.body().empty()) {
+                request_json = json::parse(req.body());
+            }
+            rest_handler->handle_openai_responses(request_json, send_response, send_streaming_response, cancellation_token);
+        });
+
+    server->register_handler("POST", "/v1/messages",
+        [rest_handler](const http::request<http::string_body>& req,
+                       std::function<void(const json&)> send_response,
+                       std::function<void(const json&, bool)> send_streaming_response,
+                       std::shared_ptr<HttpSession> session,
+                       std::shared_ptr<CancellationToken> cancellation_token) {
+            json request_json;
+            if (!req.body().empty()) {
+                request_json = json::parse(req.body());
+            }
+            rest_handler->handle_anthropic_messages(
+                request_json, send_response, send_streaming_response, cancellation_token);
+        });
+
     server->register_handler("POST", "/v1/audio/transcriptions",
         [rest_handler](const http::request<http::string_body>& req,
             std::function<void(const json&)> send_response,

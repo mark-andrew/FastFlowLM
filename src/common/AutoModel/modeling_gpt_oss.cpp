@@ -60,7 +60,9 @@ std::string GPT_OSS::apply_chat_template(nlohmann::ordered_json& messages, nlohm
     inputs.extra_context["reasoning_effort"] = this->reasoning_effort;
     inputs.extra_context["model_identity"] = this->model_identity;
     inputs.extra_context["role"] = this->role;
-    //inputs.tools = tools;
+    if (!tools.empty()) {
+        inputs.tools = tools;
+    }
 
     return this->_render_chat_template(inputs, continue_final_message);
 }
@@ -148,8 +150,7 @@ bool GPT_OSS::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std
         return false;
     }
     if (!input.messages.empty()) { // already a formated messages, usually from REST API
-        templated_text = this->apply_chat_template(input.messages);
-        //templated_text = this->apply_chat_template(input.messages, input.tools);
+        templated_text = this->apply_chat_template(input.messages, input.tools);
     }
     else if (!input.prompt.empty()) { // a pure text, usually from the cli
         nlohmann::ordered_json messages;

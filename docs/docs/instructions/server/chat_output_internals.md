@@ -7,7 +7,7 @@ parent: Local Server (Server Mode)
 
 # 🔬 Under the Hood: Output Parsing & Constrained Decoding
 
-This page is for contributors. It explains how `/v1/chat/completions` turns raw model text into `reasoning_content` / `content` / `tool_calls`, and how `tool_choice` and `response_format` restrict decoding. For the user-facing behaviour, see [Reasoning, Tool Calls & Streaming](https://fastflowlm.com/docs/instructions/server/reasoning_and_tools/) and [Structured Output & tool_choice](https://fastflowlm.com/docs/instructions/server/structured_output/).
+This page is for contributors. It explains how `/v1/chat/completions` turns raw model text into `reasoning_content` / `content` / `tool_calls`, and how `tool_choice` and `response_format` restrict decoding. `/v1/responses` translates its stateless input and output around this same chat engine. For the user-facing behaviour, see [Reasoning, Tool Calls & Streaming](https://fastflowlm.com/docs/instructions/server/reasoning_and_tools/) and [Structured Output & tool_choice](https://fastflowlm.com/docs/instructions/server/structured_output/).
 
 All of it lives in one shared library, `src/common/chat/` with headers in `src/include/chat/`. Models don't carry their own parsers any more.
 

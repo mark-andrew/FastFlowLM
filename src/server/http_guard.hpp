@@ -41,7 +41,8 @@ inline std::string route_path(std::string_view target) {
 inline bool requires_npu_access(const std::string& method, const std::string& path) {
     if (method != "POST") return false;
     return path == "/api/generate" || path == "/api/chat" || path == "/api/embeddings" ||
-           path == "/v1/chat/completions" || path == "/v1/completions" ||
+           path == "/v1/chat/completions" || path == "/v1/responses" || path == "/v1/messages" ||
+           path == "/v1/completions" ||
            path == "/v1/audio/transcriptions" || path == "/v1/embeddings" ||
            path == "/v1/systemone" || path == "/v1/decisions";
 }
@@ -313,15 +314,12 @@ inline std::optional<ojson> validate_generate(const ojson& r) { return require_s
 /// POST /api/chat: "messages" (array).
 inline std::optional<ojson> validate_chat(const ojson& r) { return require_array(r, "messages"); }
 
-/// POST /api/embeddings and /v1/embeddings: "model" (string) and "input" (a string or a
-/// non-empty array of strings).
+/// Embedding requests name a model and supply input; providers validate each input item's contents.
 inline std::optional<ojson> validate_embeddings(const ojson& r) {
     if (auto e = require_string(r, "model")) return e;
     const auto it = r.find("input");
-    const bool ok = it != r.end() &&
-        (it->is_string() || (it->is_array() && !it->empty() &&
-                             std::all_of(it->begin(), it->end(), [](const ojson& v) { return v.is_string(); })));
-    if (!ok) return error_body("'input' is required: a string or a non-empty array of strings.", 400, "input");
+    if (it == r.end()) return error_body("Missing required parameter: 'input'.", 400, "input");
+    if (it->is_array() && it->empty()) return error_body("'input' must not be an empty batch.", 400, "input");
     return std::nullopt;
 }
 

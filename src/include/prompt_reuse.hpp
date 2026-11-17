@@ -38,8 +38,38 @@ struct prompt_reuse_t {
     size_t skip = 0;                                   ///< leading tokens of the prompt the engine keeps
     bool clear = false;                                ///< the engine's context has to be dropped first (skip is then 0)
     std::array<size_t, prompt_media_t::kKinds> skipped_media{};  ///< per kind: leading items wholly inside the skip
+    size_t media_begin = 0;                            ///< first token of the media span that must be prefetched together
     size_t media_end = 0;                              ///< one past the last token of the items that are prefilled, relative to the skip (0: none)
 };
+
+/// \brief one token range passed to an engine prefill call
+struct prefill_chunk_t {
+    size_t begin = 0;
+    size_t end = 0;
+    bool carries_media = false;
+};
+
+/// \brief split a prompt into bounded chunks while keeping its media span in one chunk
+/// \note Some multimodal engines accept the image payload only alongside the complete run of image tokens.
+///       Text before that run can still be prefetched separately; widening the first chunk to the media's
+///       absolute position needlessly rereads the whole history when a new image is at the end.
+inline std::vector<prefill_chunk_t> plan_prefill_chunks(size_t token_count, size_t max_chunk,
+                                                        size_t media_begin, size_t media_end) {
+    std::vector<prefill_chunk_t> chunks;
+    if (token_count == 0) return chunks;
+    if (max_chunk == 0) max_chunk = token_count;
+    media_end = std::min(media_end, token_count);
+    media_begin = std::min(media_begin, media_end);
+
+    for (size_t begin = 0; begin < token_count;) {
+        size_t end = std::min(token_count, begin + max_chunk);
+        const bool carries_media = media_end > media_begin && media_begin < end && media_end > begin;
+        if (carries_media) end = std::max(end, media_end);
+        chunks.push_back({begin, end, carries_media});
+        begin = end;
+    }
+    return chunks;
+}
 
 /// \brief decide how much of `tokens` the engine keeps, given that it holds `history`
 /// \param history what the engine holds (AutoModel::token_history, after any restore or slot resume)
@@ -94,7 +124,9 @@ inline prompt_reuse_t plan_prompt_reuse(const std::vector<int>& history, const s
     for (const prompt_media_t& m : media) {
         if (m.end <= plan.skip) {
             plan.skipped_media[m.kind]++;
-        } else if (m.end > m.begin) {   // an item with no tokens has no rows to fit in the first chunk
+        } else if (m.end > m.begin) {   // an item with no tokens has no rows to fit in a prefill chunk
+            const size_t begin = std::max(m.begin, plan.skip) - plan.skip;
+            if (plan.media_end == 0 || begin < plan.media_begin) plan.media_begin = begin;
             plan.media_end = std::max(plan.media_end, m.end - plan.skip);
         }
     }

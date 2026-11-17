@@ -173,6 +173,34 @@ jobs:
           cmake --build build-http-guard -j"$(nproc)"
           ctest --test-dir build-http-guard --output-on-failure
 
+  # OpenAI Responses request/response and streaming conversions. Pure C++ adapter tests; no model or NPU.
+  openai-responses:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and run the OpenAI Responses adapter test
+        run: |
+          cmake -S src/test/openai_responses -B build-openai-responses -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-openai-responses -j"$(nproc)"
+          ctest --test-dir build-openai-responses --output-on-failure
+
+  # Anthropic Messages request/response and streaming conversions. Pure C++ adapter tests; no model or NPU.
+  anthropic-messages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and run the Anthropic Messages adapter test
+        run: |
+          cmake -S src/test/anthropic_messages -B build-anthropic-messages -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-anthropic-messages -j"$(nproc)"
+          ctest --test-dir build-anthropic-messages --output-on-failure
+
   # PrefixSlotCache (src/common/prefix_slot_cache.cpp) against a fake engine: which snapshot a prompt resumes from,
   # eviction, and that a snapshot is only reused for the same images (content hashes). CPU only.
   prefix-slot-cache:

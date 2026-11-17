@@ -287,17 +287,21 @@ bool Qwen3_6_MOE::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input,
         }
     }
 
-    // one past the last image token, relative to the tokens that survive _shared_insert's skip
+    // The image payload and every image token run are passed to the same prefill call.
+    // Keep their span relative to the tokens that survive _shared_insert's skip.
+    const int first_image_token_index = static_cast<int>(plan.media_begin);
     const int last_image_token_index = static_cast<int>(plan.media_end);
     const bool has_images = image_payload.num_images > 0;
 
     if (slot_mode) {
         return this->_prefix_insert(this->prefix_cache_, meta_info, tokens, full_tokens, image_hashes, match_len, "<|im_start|>user",
-                                    has_images ? static_cast<void*>(&image_payload) : nullptr, last_image_token_index, is_cancelled);
+                                    has_images ? static_cast<void*>(&image_payload) : nullptr, last_image_token_index, is_cancelled,
+                                    std::nullopt, first_image_token_index);
     }
 
     bool success = has_images
-        ? this->_shared_insert(meta_info, tokens, is_cancelled, &image_payload, last_image_token_index)
+        ? this->_shared_insert(meta_info, tokens, is_cancelled, &image_payload, last_image_token_index,
+                               std::nullopt, true, first_image_token_index)
         : this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
 
     this->_checkpoint_history();

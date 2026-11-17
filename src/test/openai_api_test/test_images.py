@@ -131,6 +131,30 @@ def webp_data_url(api: Api) -> None:
 
 
 @case
+def qwen36_late_image_after_long_text(api: Api) -> None:
+    """A late image still works when its long text prefix spans prefill chunks."""
+    if "qwen3.6-moe" not in api.model.lower():
+        raise flm_api.Skip("Qwen3.6 late-image prefill regression test")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Background dashboard note. " * 3500 + "\n" + QUESTION},
+            image_part(data_url(RED_PNG)),
+        ],
+    }]
+    response = api.post(api.body(messages, max_tokens=16))
+    if response.status != 200:
+        flm_api.raise_for_capability(response.error_message())
+        raise AssertionError(f"HTTP {response.status}: {response.error_message()}")
+    usage = response.body.get("usage") or {}
+    expect(usage.get("prompt_tokens", 0) > 8192,
+           f"test prompt did not exceed one prefill chunk: {usage}")
+    choice = response.body["choices"][0]
+    content = str(choice["message"].get("content") or "")
+    expect("red" in content.lower(), f"the model did not identify the late red image: {content!r}")
+
+
+@case
 def media_type_any_case(api: Api) -> None:
     """Media types are case-insensitive: data:image/PNG reaches the model."""
     expect_seen(api, data_url(RED_PNG, "image/PNG"), data_url(BLUE_PNG, "IMAGE/png"))

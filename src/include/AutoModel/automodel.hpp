@@ -296,15 +296,17 @@ protected:
 	/// \brief Insert tokens into the model
 	/// \param meta_info the meta information of the chat
 	/// \param tokens the tokens to insert
-	/// \param payload the payload, it shall not be used as this function is only used for chunkwised insertion, no image allowed
+	/// \param payload optional multimodal payload; it is passed with the prefill chunk containing its media tokens
+	/// \param first_len_run one past the last token that requires the payload
+	/// \param first_payload_token_index first token that requires the payload; zero keeps legacy first-chunk behavior
 	/// \return true if the tokens were inserted successfully, false otherwise
-	bool _shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; }, void* payload = nullptr, int first_len_run = 0, std::optional<int> requested_max_new_tokens = std::nullopt, bool sample_next = true);
+	bool _shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; }, void* payload = nullptr, int first_len_run = 0, std::optional<int> requested_max_new_tokens = std::nullopt, bool sample_next = true, int first_payload_token_index = 0);
 
 	/// \brief decide how much of a prompt with media the engine keeps, before the model trims its payload
 	/// \param tokens the prompt exactly as it will go to _shared_insert / _prefix_insert (after any restore or slot
 	///        resume, with the generation-prompt tokens the model feeds itself already cut)
 	/// \param media its images and audio clips (see prompt_reuse.hpp), with their content hashes
-	/// \return the plan: drop skipped_media[kind] leading items of each payload list and pass media_end as first_len_run
+	/// \return the plan: drop skipped_media[kind] leading items of each payload list and pass the media span to prefill
 	/// \note Clears the context when the plan says so, so the _shared_insert that follows skips exactly plan.skip;
 	///       _shared_insert checks that it does when it gets a payload.
 	prompt_reuse_t _plan_reuse(const std::vector<int>& tokens, const std::vector<prompt_media_t>& media);
@@ -356,10 +358,11 @@ protected:
 	///        the shared head (system + tools), saved as its own slot while prefilling when it is long enough
 	/// \param payload image payload or nullptr; a prompt with images is not split at the boundary
 	/// \param last_image_token_index as _shared_insert's first_len_run
+	/// \param first_image_token_index beginning of the image run relative to the tokens after the cache skip
 	bool _prefix_insert(PrefixSlotCache& cache, chat_meta_info_t& meta_info, std::vector<int>& tokens, const std::vector<int>& full_tokens,
 	                    const std::vector<uint64_t>& image_hashes, size_t match_len, const std::string& boundary_marker,
 	                    void* payload, int last_image_token_index, std::function<bool()> is_cancelled,
-	                    std::optional<int> requested_max_new_tokens = std::nullopt);
+	                    std::optional<int> requested_max_new_tokens = std::nullopt, int first_image_token_index = 0);
 
 	/// \brief the cache that holds this model's saved prompt snapshots; disabled until _prefix_attach() gives it an engine
 	PrefixSlotCache prefix_cache_;
@@ -397,7 +400,11 @@ protected:
 	///       their existing behaviour of truncating rather than refusing.
 	/// \throws ModelRequestError 400 when prompt plus output cannot fit
 	void _shared_validate_capacity(std::size_t rendered_tokens, std::optional<int> requested) const;
-	buffer<bf16> _chunked_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; }, void* payload = nullptr, int first_len_run = 0);
+	/// \brief prefill tokens in chunks, keeping the payload's token span together
+	/// \param first_len_run one past the last token that requires the payload
+	/// \param first_payload_token_index first token of that span; zero preserves first-chunk behavior
+	buffer<bf16> _chunked_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; },
+	                              void* payload = nullptr, int first_len_run = 0, int first_payload_token_index = 0);
 	std::string _shared_generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled = [] { return false; });
 
 	/// \brief asked by _shared_generate after every decoded token; true ends the reply as a length stop
@@ -768,5 +775,3 @@ public:
 	virtual std::string apply_chat_template(nlohmann::ordered_json& messages, nlohmann::ordered_json tools = nlohmann::ordered_json::object(), bool continue_final_message = false) = 0;
 
 };
-
-

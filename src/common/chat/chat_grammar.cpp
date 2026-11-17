@@ -475,9 +475,12 @@ json harmony_format(const chat_constraint_request& request, const std::vector<to
         }
     }
     std::vector<json> message_tags;
-    message_tags.push_back(tag("<|channel|>analysis<|message|>", any_text(), FINAL_END));
+    // A message opener inside free text can masquerade as a tool call to the Harmony parser.
+    const std::vector<std::string> message_openers = {"<|start|>"};
+    message_tags.push_back(tag("<|channel|>analysis<|message|>", any_text(message_openers), FINAL_END));
     if (request.tool_choice == chat_tool_choice::AUTO || request.tool_choice == chat_tool_choice::NONE) {
-        json final_content = has_response_format(request) ? schema_content(response_schema(request)) : any_text();
+        json final_content = has_response_format(request) ? schema_content(response_schema(request))
+                                                          : any_text(message_openers);
         message_tags.push_back(tag("<|channel|>final<|message|>", final_content, FINAL_END));
     }
 

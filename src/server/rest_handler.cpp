@@ -11,6 +11,8 @@
 #include "wstream_buf.hpp"
 #include "streaming_ostream.hpp"
 #include "streaming_ostream_openai.hpp"
+#include "openai_responses.hpp"
+#include "anthropic_messages.hpp"
 #include "image/image_reader.hpp"
 #include "image/raw_rgb8.hpp"
 #include "base64.hpp"
@@ -664,7 +666,7 @@ static json convert_tool_responses_gemma4(json messages) {
 ///@return the rest handler
 RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, program_args_t& args,
                          flm_rt::device* npu_device)
-    : supported_models(models), downloader(downloader), default_model_tag(args.model_tag), current_model_tag(""), modelscope(args.modelscope), asr(args.asr), embed(args.embed), img_pre_resize(args.img_pre_resize), preemption(args.preemption), backend(args.backend) {
+    : supported_models(models), downloader(downloader), default_model_tag(args.model_tag), current_model_tag(""), modelscope(args.modelscope), asr(args.asr), img_pre_resize(args.img_pre_resize), preemption(args.preemption), backend(args.backend) {
 
     // RAI receives the device from corelib; non-RAI creates its own here.
     if (npu_device != nullptr) {
@@ -700,28 +702,29 @@ RestHandler::RestHandler(model_list& models, ModelDownloader& downloader, progra
     this->raw_rgb8_limits.max_frames = (size_t)std::max(args.max_raw_frames, 1);
     this->raw_rgb8_limits.max_bytes = (size_t)std::max(args.max_raw_mb, 1) * 1024 * 1024;
 
+    default_model_tag = supported_models.rectify_model_tag(default_model_tag);
+    const bool embedding_only = supported_models.is_model_supported(default_model_tag) &&
+        is_embedding_model(supported_models.get_model_info(default_model_tag).second);
+    if (embedding_only) ensure_embed_model_loaded(default_model_tag);
     // Initialize chat bot with default model
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
     if (this->asr) {
         ensure_asr_model_loaded(args.asr_tag);
     }
-    if (this->embed) {
-        ensure_embed_model_loaded(args.embed_tag);
-    }
 #else
     if (this->asr) {
         header_print("Error", "ASR models are not supported in this build");
     }
-    if (this->embed) {
-        header_print("Error", "Embedding models are not supported in this build");
-    }
 #endif
+    if (args.embed && !embedding_only) {
+        ensure_embed_model_loaded(args.embed_tag);
+    }
 
     if (!args.decision.empty()) {
         ensure_decision_model_loaded(args.decision);
     }
 
-    if (default_model_tag != "model-faker") {
+    if (default_model_tag != "model-faker" && !embedding_only) {
         if (!supported_models.is_model_supported(default_model_tag)) {
             header_print("Warning", "Default model tag '" << default_model_tag << "' is not supported. Falling back to 'llama3.2:1b'.");
             this->default_model_tag = "llama3.2:1b";
@@ -944,39 +947,6 @@ void RestHandler::handle_systemone(const std::string& raw_body,
         reply["__http_body"] = {{"detail", std::string("the server failed on this request (") + e.what() + ")"}};
     }
     send_response(reply);
-}
-
-///@brief Ensure the embed model is loaded
-///@param model_tag the model tag
-void RestHandler::ensure_embed_model_loaded(const std::string& model_tag) {
-#ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
-    std::string ensure_tag = model_tag;
-    switch (this->downloader.is_model_downloaded(ensure_tag, false, /*fast_check=*/true)) {
-        case ModelDownloader::ModelStatus::Ready:
-            break;
-        case ModelDownloader::ModelStatus::Outdated:
-        case ModelDownloader::ModelStatus::Missing:
-            this->downloader.pull_model(ensure_tag, this->modelscope);
-            break;
-        case ModelDownloader::ModelStatus::Incompatible:
-            header_print("ERROR", "EmbeddingGemma is incompatible with this version of FastFlowLM, skipping... ");
-            this->embed = false;
-            return;
-    }
-    auto [embedding_model_tag, auto_embedding_engine] = get_auto_embedding_model(ensure_tag, this->npu_device_inst);
-    this->auto_embedding_engine = std::move(auto_embedding_engine);
-    auto [new_embedding_model_tag, embedding_model_info] = this->supported_models.get_model_info(embedding_model_tag);
-    std::string embedding_model_path = this->supported_models.get_model_path(new_embedding_model_tag);
-    try {
-        this->auto_embedding_engine->load_model(embedding_model_path, embedding_model_info, this->preemption);
-    }
-    catch (const std::exception& e) {
-        header_print("ERROR", "Failed to load embedding model: " + std::string(e.what()));
-        exit(EXIT_FAILURE);
-    }
-#else
-    throw std::runtime_error("Embedding models are not supported in this build");
-#endif
 }
 
 ///@brief Configure chat engine parameters from options and request
@@ -1397,83 +1367,6 @@ void RestHandler::handle_chat(const json& request,
     }
 }
 
-///@brief Handle the embeddings request
-///@param request the request
-///@param send_response the send response
-///@param send_streaming_response the send streaming response
-void RestHandler::handle_embeddings(const json& request,
-                                   std::function<void(const json&)> send_response,
-                                   StreamResponseCallback send_streaming_response) {
-    try {
-        // "model" must be a string and "input" a string or a non-empty array of strings.
-        if (auto bad = flm::http_guard::validate_embeddings(request)) {
-            send_response(*bad);
-            return;
-        }
-        std::string model = request.at("model").get<std::string>();
-        std::vector<std::string> inputs;
-        const json& input = request.at("input");
-        if (input.is_string()) {
-            inputs.push_back(input.get<std::string>());
-        }
-        else {
-            for (const auto& item : input) {
-                inputs.push_back(item.get<std::string>());
-            }
-        }
-
-        json response;
-        if (this->embed) {
-            json embedding_data = json::array();
-#ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
-            for (size_t i = 0; i < inputs.size(); ++i) {
-                std::cout << "Embedding input[" << i << "]: " << "\n" << inputs[i] << std::endl;
-                std::vector<float> embedding_result = this->auto_embedding_engine->embed(inputs[i], embedding_task_type_t::task_query);
-                embedding_data.push_back({
-                    {"object", "embedding"},
-                    {"embedding", embedding_result},
-                    {"index", i}
-                });
-            }
-#else
-            throw std::runtime_error("Embedding models are not supported in this build");
-#endif
-
-            response = {
-                {"object", "list"},
-                {"data", embedding_data},
-                {"model", model},
-                {"usage", {
-                    {"prompt_tokens", 0},
-                    {"total_tokens", 0}
-                }}
-            };
-        }
-        else {
-            header_print("Warning", "No embedding model loaded");
-            send_response({{"error", {{"message", "No embedding model is loaded; start the server with --embed 1."},
-                                      {"type", "invalid_request_error"},
-                                      {"code", 400}}}});
-            return;
-        }
-        send_response(response);
-    }
-    catch (const json::exception& e) {
-        // A missing or mistyped "model" / "input": the request is at fault
-        send_response({{"error", {{"message", std::string("Invalid embeddings request: ") + e.what()},
-                                  {"type", "invalid_request_error"},
-                                  {"code", 400}}}});
-    }
-    catch (const std::exception& e) {
-        // A failed NPU dispatch throws from embed(); it must reach the client as a 5xx, not a 200
-        // whose body is an error string (the 200 is what let a broken vector look like an answer).
-        header_print("ERROR", std::string("Embedding failed: ") + e.what());
-        send_response({{"error", {{"message", e.what()},
-                                  {"type", "server_error"},
-                                  {"code", 500}}}});
-    }
-}
-
 ///@brief Handle the models request
 ///@param request the request
 ///@param send_response the send response
@@ -1818,6 +1711,10 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         chat_parse_options parse_options;
         parse_options.tools = &tools;
         parse_options.parse_tool_calls = !tools.empty() && constraint_request.tool_choice != chat_tool_choice::NONE;
+        parse_options.auto_tool_choice = constraint_request.tool_choice == chat_tool_choice::AUTO &&
+                                         !constraint_request.json_object &&
+                                         constraint_request.json_schema.is_null() &&
+                                         auto_chat_engine->get_chat_format().kind == chat_format_kind::HARMONY;
         parse_options.keep_whitespace = continue_final;
         // a model that reasons first reads the continued message as its reasoning
         parse_options.reasoning_may_close = continue_final && auto_chat_engine->thinking_enabled();
@@ -1983,6 +1880,140 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             }}
         };
         send_response(error_response);
+    }
+}
+
+///@brief Handle an OpenAI Responses request by adapting it to the shared chat engine.
+///@note Responses storage/previous_response_id is intentionally not implemented:
+///      clients must send the conversation history in `input`.
+void RestHandler::handle_openai_responses(const json& request,
+                                         std::function<void(const json&)> send_response,
+                                         StreamResponseCallback send_streaming_response,
+                                         std::shared_ptr<CancellationToken> cancellation_token) {
+    json chat_request;
+    std::string error;
+    std::string param;
+    try {
+        if (!openai_responses::to_chat_request(request, current_model_tag,
+                                               chat_request, error, param)) {
+            send_response({
+                {"error", {
+                    {"message", error},
+                    {"type", "invalid_request_error"},
+                    {"param", param.empty() ? json(nullptr) : json(param)},
+                    {"code", 400}
+                }}
+            });
+            return;
+        }
+
+        const bool stream = chat_request.value("stream", false);
+        const std::string model = chat_request.value("model", current_model_tag);
+        if (!stream) {
+            json chat_response;
+            bool response_received = false;
+            handle_openai_chat_completion(
+                chat_request,
+                [&](const json& response) {
+                    chat_response = response;
+                    response_received = true;
+                },
+                [](const json&, bool) {},
+                cancellation_token);
+            if (!response_received) {
+                send_response(OpenAIExceptionResponse(
+                    std::runtime_error("Chat Completions backend returned no response")));
+                return;
+            }
+            send_response(openai_responses::from_chat_response(chat_response, request));
+            return;
+        }
+
+        openai_responses::StreamEncoder encoder(
+            model, request,
+            [&send_streaming_response](const json& data, bool is_final) {
+                send_streaming_response(data, is_final);
+            });
+        handle_openai_chat_completion(
+            chat_request,
+            [&](const json& response) {
+                if (response.contains("error")) {
+                    send_response(response);
+                } else {
+                    send_response(openai_responses::from_chat_response(response, request));
+                }
+            },
+            [&encoder](const json& data, bool is_final) {
+                encoder.on_chat_chunk(data, is_final);
+            },
+            cancellation_token);
+    } catch (const std::exception& e) {
+        send_response(OpenAIExceptionResponse(e));
+    }
+}
+
+///@brief Handle an Anthropic Messages request by adapting it to the shared chat engine.
+///@note Conversation history must be sent in `messages`; FLM does not persist Anthropic message state.
+void RestHandler::handle_anthropic_messages(const json& request,
+                                           std::function<void(const json&)> send_response,
+                                           StreamResponseCallback send_streaming_response,
+                                           std::shared_ptr<CancellationToken> cancellation_token) {
+    json chat_request;
+    std::string error;
+    std::string param;
+    try {
+        if (!anthropic_messages::to_chat_request(request, current_model_tag,
+                                                 chat_request, error, param)) {
+            send_response(anthropic_messages::make_error(error, "invalid_request_error", param));
+            return;
+        }
+
+        const bool stream = chat_request.value("stream", false);
+        if (!stream) {
+            json chat_response;
+            bool response_received = false;
+            handle_openai_chat_completion(
+                chat_request,
+                [&](const json& response) {
+                    chat_response = response;
+                    response_received = true;
+                },
+                [](const json&, bool) {},
+                cancellation_token);
+            if (!response_received) {
+                send_response(anthropic_messages::make_error(
+                    "Chat Completions backend returned no response", "api_error"));
+                return;
+            }
+            send_response(anthropic_messages::from_chat_response(chat_response, request));
+            return;
+        }
+
+        const std::string model = chat_request.value("model", current_model_tag);
+        anthropic_messages::StreamEncoder encoder(
+            model,
+            [&send_streaming_response](const json& data, bool is_final) {
+                send_streaming_response(data, is_final);
+            });
+        handle_openai_chat_completion(
+            chat_request,
+            [&](const json& response) {
+                if (response.contains("error")) {
+                    if (encoder.started()) {
+                        encoder.on_chat_error(response);
+                    } else {
+                        send_response(anthropic_messages::from_chat_response(response, request));
+                    }
+                } else {
+                    send_response(anthropic_messages::from_chat_response(response, request));
+                }
+            },
+            [&encoder](const json& data, bool is_final) {
+                encoder.on_chat_chunk(data, is_final);
+            },
+            cancellation_token);
+    } catch (const std::exception& e) {
+        send_response(anthropic_messages::make_error(e.what(), "api_error"));
     }
 }
 
