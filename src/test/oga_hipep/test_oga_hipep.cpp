@@ -45,6 +45,10 @@ struct OgaGenerator {
     /// \brief the length of the last OgaGenerator_SnapshotState
     std::optional<std::size_t> snapshot;
 };
+struct OgaImages {
+    std::size_t count = 0;
+};
+struct OgaMultiModalProcessor {};
 struct OgaTensor {
     OgaElementType type = OgaElementType_float32;
     std::vector<std::int64_t> shape;
@@ -99,6 +103,17 @@ struct FakeOga {
     std::string device = "AMDGPU";
     /// \brief each OgaRegisterExecutionProviderLibrary call, as name and path
     std::vector<std::pair<std::string, std::string>> registrations;
+    /// \brief each OgaConfigSetProviderOption call
+    struct ProviderOption {
+        std::string provider;
+        std::string key;
+        std::string value;
+    };
+    std::vector<ProviderOption> provider_options;
+    /// \brief prompts handed to OgaProcessorProcessImages
+    std::vector<std::string> processed_prompts;
+    /// \brief image counts handed to OgaLoadImagesFromBuffers
+    std::vector<std::size_t> loaded_images;
     std::optional<std::string> fail_registration;
 };
 
@@ -139,6 +154,11 @@ OgaResult* OGA_API_CALL FakeConfigClearProviders(OgaConfig*) {
 }
 OgaResult* OGA_API_CALL FakeConfigAppendProvider(OgaConfig*, const char* provider) {
     g_fake.providers.emplace_back(provider);
+    return nullptr;
+}
+OgaResult* OGA_API_CALL FakeConfigSetProviderOption(OgaConfig*, const char* provider, const char* key,
+                                                    const char* value) {
+    g_fake.provider_options.push_back({provider, key, value});
     return nullptr;
 }
 OgaResult* OGA_API_CALL FakeConfigOverlay(OgaConfig*, const char* json) {
@@ -340,6 +360,42 @@ OgaResult* OGA_API_CALL FakeRewindTo(OgaGenerator* generator, size_t length) {
     return nullptr;
 }
 
+OgaResult* OGA_API_CALL FakeLoadImages(const void**, const size_t*, size_t count, OgaImages** out) {
+    g_fake.loaded_images.push_back(count);
+    *out = new OgaImages{count};
+    return nullptr;
+}
+void OGA_API_CALL FakeDestroyImages(OgaImages* images) { delete images; }
+OgaResult* OGA_API_CALL FakeCreateProcessor(const OgaModel*, OgaMultiModalProcessor** out) {
+    *out = new OgaMultiModalProcessor;
+    return nullptr;
+}
+void OGA_API_CALL FakeDestroyProcessor(OgaMultiModalProcessor* processor) { delete processor; }
+OgaResult* OGA_API_CALL FakeProcessImages(const OgaMultiModalProcessor*, const char* prompt, const OgaImages*,
+                                          OgaNamedTensors** out) {
+    g_fake.processed_prompts.emplace_back(prompt);
+    auto* named = new OgaNamedTensors;
+    OgaTensor ids;
+    ids.type = OgaElementType_int32;
+    ids.shape = {1, 3};
+    const std::int32_t tokens[] = {7, 8, 9};
+    ids.data.resize(sizeof(tokens));
+    std::memcpy(ids.data.data(), tokens, sizeof(tokens));
+    named->tensors.emplace("input_ids", std::move(ids));
+    OgaTensor pixels;
+    pixels.type = OgaElementType_float16;
+    pixels.shape = {1, 0, 0};
+    named->tensors.emplace("pixel_values", std::move(pixels));
+    *out = named;
+    return nullptr;
+}
+OgaResult* OGA_API_CALL FakeNamedTensorsGet(OgaNamedTensors* named, const char* name, OgaTensor** out) {
+    const auto it = named->tensors.find(name);
+    if (it == named->tensors.end()) return Error(std::string("no ") + name);
+    *out = &it->second;
+    return nullptr;
+}
+
 std::map<std::string, void*> FakeSymbols() {
     return {
         {"OgaResultGetError", reinterpret_cast<void*>(&FakeResultGetError)},
@@ -349,6 +405,7 @@ std::map<std::string, void*> FakeSymbols() {
         {"OgaCreateConfig", reinterpret_cast<void*>(&FakeCreateConfig)},
         {"OgaConfigClearProviders", reinterpret_cast<void*>(&FakeConfigClearProviders)},
         {"OgaConfigAppendProvider", reinterpret_cast<void*>(&FakeConfigAppendProvider)},
+        {"OgaConfigSetProviderOption", reinterpret_cast<void*>(&FakeConfigSetProviderOption)},
         {"OgaConfigOverlay", reinterpret_cast<void*>(&FakeConfigOverlay)},
         {"OgaDestroyConfig", reinterpret_cast<void*>(&FakeDestroyConfig)},
         {"OgaCreateModelFromConfig", reinterpret_cast<void*>(&FakeCreateModelFromConfig)},
@@ -373,6 +430,12 @@ std::map<std::string, void*> FakeSymbols() {
         {"OgaGenerator_SetInputs", reinterpret_cast<void*>(&FakeSetInputs)},
         {"OgaGenerator_SnapshotState", reinterpret_cast<void*>(&FakeSnapshotState)},
         {"OgaGenerator_RewindTo", reinterpret_cast<void*>(&FakeRewindTo)},
+        {"OgaLoadImagesFromBuffers", reinterpret_cast<void*>(&FakeLoadImages)},
+        {"OgaDestroyImages", reinterpret_cast<void*>(&FakeDestroyImages)},
+        {"OgaCreateMultiModalProcessor", reinterpret_cast<void*>(&FakeCreateProcessor)},
+        {"OgaDestroyMultiModalProcessor", reinterpret_cast<void*>(&FakeDestroyProcessor)},
+        {"OgaProcessorProcessImages", reinterpret_cast<void*>(&FakeProcessImages)},
+        {"OgaNamedTensorsGet", reinterpret_cast<void*>(&FakeNamedTensorsGet)},
     };
 }
 
@@ -833,6 +896,198 @@ void TestTheRewindEntryPointsAreOptional() {
     TEST_REQUIRE(g_fake.generators_created == 2);
 }
 
+// ---- several conversations: one generator slot each ---------------------------
+
+/// \brief a fresh fake and an engine over OGA 0.19 that keeps up to `slots` generators
+std::unique_ptr<flm::oga::OgaEngine> MakeSlotsEngine(std::size_t slots, std::uint32_t max_length = 32) {
+    g_fake = FakeOga{};
+    flm::oga::OgaApi::Owned<OgaModel> model(new OgaModel, {&FakeDestroyModel});
+    flm::oga::OgaSlotLimits limits;
+    limits.count = slots;
+    return std::make_unique<flm::oga::OgaEngine>(FakeApi(FakeSymbols(), {"test", {}, {0, 19, 0, 0}}),
+                                                 std::move(model), "Test", kVocab, 64, max_length,
+                                                 std::nullopt, false, limits);
+}
+
+/// \brief what the frontend does for a prompt that does not continue its history:
+///        clear the context, then prefill the whole prompt and checkpoint it
+buffer<bf16> NewPrompt(flm::oga::OgaEngine& engine, std::vector<int> prompt) {
+    engine.clear_context();
+    auto logits = engine.prefill(prompt);
+    engine.checkpoint();
+    return logits;
+}
+
+void TestTwoConversationsTakingTurnsEachKeepTheirSlot() {
+    auto engine = MakeSlotsEngine(2);
+    TEST_REQUIRE(engine->slot_limit() == 2);
+    NewPrompt(*engine, {1, 2, 3});
+    engine->forward(4);
+    NewPrompt(*engine, {7, 8, 9});
+    engine->forward(10);
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    TEST_REQUIRE(g_fake.generators_live == 2);
+    const auto reused = engine->reused_tokens();
+
+    // A2 continues A's generator, which still holds A1 and its reply
+    RequireState(NewPrompt(*engine, {1, 2, 3, 4, 5}), 5, 5, 15);
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{5}));
+    TEST_REQUIRE(engine->reused_tokens() - reused == 4);
+    TEST_REQUIRE(engine->replayed_tokens() == 0);
+
+    // B2 rewinds B's generator to B1's checkpoint
+    RequireState(NewPrompt(*engine, {7, 8, 9, 11}), 4, 11, 35);
+    TEST_REQUIRE(g_fake.rewinds == (std::vector<std::size_t>{3}));
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{11}));
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    TEST_REQUIRE(engine->reused_tokens() - reused == 7);
+}
+
+void TestTheLeastRecentlyUsedSlotIsRebuilt() {
+    auto engine = MakeSlotsEngine(2);
+    NewPrompt(*engine, {1, 2});   // A
+    NewPrompt(*engine, {5, 6});   // B
+    NewPrompt(*engine, {1, 2, 3});  // A again: B is now the least recently used
+    NewPrompt(*engine, {9});      // C takes B's slot
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    TEST_REQUIRE(g_fake.generators_live == 2);
+    RequireState(NewPrompt(*engine, {1, 2, 3, 4}), 4, 4, 10);
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{4}));
+    // B is gone, so it replays; it takes C's slot, the least recently used
+    RequireState(NewPrompt(*engine, {5, 6, 7}), 3, 7, 18);
+    TEST_REQUIRE(g_fake.generators_created == 4);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{5, 6, 7}));
+    RequireState(NewPrompt(*engine, {1, 2, 3, 4, 8}), 5, 8, 18);
+    TEST_REQUIRE(g_fake.generators_created == 4);
+}
+
+void TestOneSlotKeepsOneGenerator() {
+    auto engine = MakeSlotsEngine(1);
+    NewPrompt(*engine, {1, 2, 3});
+    NewPrompt(*engine, {7, 8});
+    TEST_REQUIRE(g_fake.generators_live == 1);
+    RequireState(NewPrompt(*engine, {1, 2, 3, 4}), 4, 4, 10);
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{1, 2, 3, 4}));
+}
+
+void TestTheSamePromptAgainRunsNothing() {
+    auto engine = MakeSlotsEngine(1);
+    NewPrompt(*engine, {1, 2, 3});
+    engine->forward(4);
+    const auto appends = g_fake.appends.size();
+    const auto reused = engine->reused_tokens();
+    // the logits saved with the checkpoint, not the live generator's [1, 2, 3, 4]
+    RequireState(NewPrompt(*engine, {1, 2, 3}), 3, 3, 6);
+    TEST_REQUIRE(g_fake.appends.size() == appends);
+    TEST_REQUIRE(g_fake.rewinds == (std::vector<std::size_t>{3}));
+    TEST_REQUIRE(g_fake.generators_created == 1);
+    TEST_REQUIRE(engine->reused_tokens() - reused == 3);
+    TEST_REQUIRE(engine->replayed_tokens() == 0);
+    // and decoding goes on from the checkpoint
+    RequireState(engine->forward(5), 4, 5, 11);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{5}));
+
+    // twice in a row, with nothing decoded in between, still runs nothing
+    NewPrompt(*engine, {1, 2, 3});
+    const auto again = g_fake.appends.size();
+    RequireState(NewPrompt(*engine, {1, 2, 3}), 3, 3, 6);
+    TEST_REQUIRE(g_fake.appends.size() == again);
+}
+
+void TestAChunkedPromptReachesALongerSlot() {
+    auto engine = MakeSlotsEngine(2);
+    NewPrompt(*engine, {1, 2, 3, 4, 5, 6});
+    engine->forward(7);
+    NewPrompt(*engine, {20, 21});
+    const auto reused = engine->reused_tokens();
+    const auto appends = g_fake.appends.size();
+
+    // the frontend sends A2 in two chunks, the first shorter than A's checkpoint
+    engine->clear_context();
+    const std::vector<int> a2{1, 2, 3, 4, 5, 6, 8, 9};
+    engine->expect_prefill(a2);
+    std::vector<int> head(a2.begin(), a2.begin() + 4);
+    std::vector<int> tail(a2.begin() + 4, a2.end());
+    engine->prefill(head);  // its logits are not used
+    TEST_REQUIRE(g_fake.appends.size() == appends);
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    RequireRan(engine->prefill(tail), a2);
+    TEST_REQUIRE(g_fake.rewinds == (std::vector<std::size_t>{6}));
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{8, 9}));
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    TEST_REQUIRE(engine->reused_tokens() - reused == 6);
+    TEST_REQUIRE(engine->get_current_context_length() == 8);
+
+    // a prompt that leaves what it said it would send is matched on its own tokens
+    engine->clear_context();
+    engine->expect_prefill({20, 21, 22, 23});
+    std::vector<int> other{1, 2, 3, 4, 5, 6, 8, 9, 10};
+    RequireRan(engine->prefill(other), other);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{10}));
+}
+
+void TestAnOgaErrorDropsOnlyItsSlot() {
+    auto engine = MakeSlotsEngine(2);
+    NewPrompt(*engine, {1, 2, 3});
+    NewPrompt(*engine, {7, 8});
+    g_fake.fail_next_append = "device lost";
+    RequireThrows<flm::oga::OgaError>([&] { engine->forward(9); });
+    TEST_REQUIRE(g_fake.generators_live == 1);
+    RequireState(NewPrompt(*engine, {1, 2, 3, 4}), 4, 4, 10);
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{4}));
+}
+
+void TestTheSlotCountFitsTheBudget() {
+    flm::oga::OgaSlotLimits limits;
+    limits.count = 4;
+    limits.budget_bytes = 4096ull << 20;
+    limits.bytes_per_position = 32 << 10;
+    // the 9B package: 1 GiB a slot at 32k, 4 GiB at 128k; the first slot is outside the budget
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 32768) == 4);
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 65536) == 3);
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 131072) == 2);
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 262144) == 1);
+    limits.budget_bytes = 0;
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 8) == 1);
+    limits.bytes_per_position = 0;  // a size the package does not tell
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 32768) == 4);
+    limits.count = 0;
+    TEST_REQUIRE(flm::oga::SlotsWithin(limits, 32768) == 1);
+
+    // a larger maximum length lowers the limit, and drops the slots too small for it
+    g_fake = FakeOga{};
+    flm::oga::OgaApi::Owned<OgaModel> model(new OgaModel, {&FakeDestroyModel});
+    flm::oga::OgaSlotLimits engine_limits;
+    engine_limits.count = 3;
+    engine_limits.budget_bytes = 64;
+    engine_limits.bytes_per_position = 1;
+    flm::oga::OgaEngine engine(FakeApi(FakeSymbols(), {"test", {}, {0, 19, 0, 0}}), std::move(model),
+                               "Test", kVocab, 64, 32, std::nullopt, false, engine_limits);
+    TEST_REQUIRE(engine.slot_limit() == 3);
+    NewPrompt(engine, {1});
+    NewPrompt(engine, {2});
+    NewPrompt(engine, {3});
+    TEST_REQUIRE(g_fake.generators_live == 3);
+    engine.clear_context();
+    engine.update_max_length(64);
+    TEST_REQUIRE(engine.slot_limit() == 2);
+    TEST_REQUIRE(g_fake.generators_live == 0);
+    // a smaller one drops the larger slots too: next to others they would overrun the budget
+    NewPrompt(engine, {1});
+    NewPrompt(engine, {2});
+    TEST_REQUIRE(g_fake.generators_live == 2);
+    engine.clear_context();
+    engine.update_max_length(32);
+    TEST_REQUIRE(engine.slot_limit() == 3);
+    TEST_REQUIRE(g_fake.generators_live == 0);
+    NewPrompt(engine, {1});
+    TEST_REQUIRE(g_fake.last_max_length == 32);
+}
+
 void TestAnImagePromptRunsInOneSetInputsAfterAWarmUp() {
     auto engine = MakeVisionEngine();
     const auto image = Image(4, 4);
@@ -1178,6 +1433,126 @@ void TestOpenModelPutsTheDecoderOnTheRegisteredEpAlone() {
     TEST_REQUIRE(g_fake.providers == (std::vector<std::string>{"AMDGPUExecutionProvider"}));
     TEST_REQUIRE(g_fake.overlays.size() == 1);
     RequireContains(g_fake.overlays[0], R"("decoder":{"session_options":{"session.disable_cpu_ep_fallback":"1"}})");
+}
+
+void TestAStagedImagePromptIsTheNextPrefill() {
+    auto engine = MakeEngine();
+    const std::vector<std::string> images{"PNG_FAKE", "JPEGFAKE"};
+    const auto ids = engine->StagePromptImages("see <image> and <image>", images);
+    TEST_REQUIRE(ids == (std::vector<int>{7, 8, 9}));
+    TEST_REQUIRE(g_fake.loaded_images == (std::vector<std::size_t>{2}));
+    TEST_REQUIRE(g_fake.processed_prompts.size() == 1);
+    TEST_REQUIRE(g_fake.processed_prompts[0] == "see <image> and <image>");
+    // Clearing the text history must keep the staged processor inputs.
+    engine->clear_context();
+    std::vector<int> prompt = ids;
+    engine->prefill(prompt);
+    TEST_REQUIRE(g_fake.set_inputs.size() == 1);
+    TEST_REQUIRE(g_fake.set_inputs[0].ids == (std::vector<std::int32_t>{7, 8, 9}));
+    TEST_REQUIRE(g_fake.appends.empty());
+    TEST_REQUIRE(g_fake.generators_created == 1);
+}
+
+void TestADroppedOrRefusedStageDoesNotReachTheNextPrefill() {
+    auto engine = MakeEngine();
+    // A request that stopped before its prefill drops its stage: the next text prompt runs as text.
+    engine->StagePromptImages("see <image>", {"PNG_FAKE"});
+    engine->DropStagedPrompt();
+    std::vector<int> text{1, 2};
+    engine->prefill(text);
+    TEST_REQUIRE(g_fake.set_inputs.empty());
+    TEST_REQUIRE(g_fake.appends == (std::vector<Tokens>{{1, 2}}));
+
+    // A prefill that does not match the stage is refused, and takes the stage with it.
+    engine->clear_context();
+    engine->StagePromptImages("see <image>", {"PNG_FAKE"});
+    std::vector<int> suffix{8, 9};
+    RequireContains(RequireThrows<std::runtime_error>([&] { engine->prefill(suffix); }),
+                    "whole sequence");
+    std::vector<int> again{1, 2};
+    engine->prefill(again);
+    TEST_REQUIRE(g_fake.set_inputs.empty());
+}
+
+/// \brief what the gemma4-12b frontend does for an image prompt: stage it, clear the
+///        history, prefill the processor's whole sequence and checkpoint it
+buffer<bf16> RunStagedPrompt(flm::oga::OgaEngine& engine) {
+    std::vector<int> ids = engine.StagePromptImages("see <image>", {"PNG_FAKE"});
+    engine.clear_context();
+    auto logits = engine.prefill(ids);
+    engine.DropStagedPrompt();
+    engine.checkpoint();
+    return logits;
+}
+
+void TestAStagedImagePromptTakesTheLeastRecentlyUsedSlot() {
+    auto engine = MakeSlotsEngine(2);
+    NewPrompt(*engine, {1, 2, 3});  // A
+    engine->forward(4);
+    NewPrompt(*engine, {4, 5});     // B: A is now the least recently used
+    // the image prompt [7, 8, 9] gets a new generator in A's slot, and B keeps its own
+    RequireState(RunStagedPrompt(*engine), 3, 9, 24);
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    TEST_REQUIRE(g_fake.generators_live == 2);
+    TEST_REQUIRE(g_fake.set_inputs.size() == 1);
+    TEST_REQUIRE(g_fake.set_inputs.back().ids == (std::vector<std::int32_t>{7, 8, 9}));
+    TEST_REQUIRE(engine->get_current_context_length() == 3);
+    // decoding continues the image slot
+    RequireState(engine->forward(10), 4, 10, 34);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{10}));
+
+    // B continues its generator
+    RequireState(NewPrompt(*engine, {4, 5, 6}), 3, 6, 15);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{6}));
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    // so does the image conversation's next turn, without the processor
+    RequireState(NewPrompt(*engine, {7, 8, 9, 10, 11}), 5, 11, 45);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{11}));
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    TEST_REQUIRE(g_fake.set_inputs.size() == 1);
+    // A was replaced, so it replays, in B's slot, now the least recently used
+    RequireState(NewPrompt(*engine, {1, 2, 3, 4}), 4, 4, 10);
+    TEST_REQUIRE(g_fake.generators_created == 4);
+    TEST_REQUIRE(g_fake.generators_live == 2);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{1, 2, 3, 4}));
+}
+
+void TestAStagedImagePromptAlwaysBuildsANewGenerator() {
+    auto engine = MakeSlotsEngine(2);
+    RunStagedPrompt(*engine);
+    // The same ids again may carry other images: the processor's inputs run in a new generator.
+    RunStagedPrompt(*engine);
+    TEST_REQUIRE(g_fake.generators_created == 2);
+    TEST_REQUIRE(g_fake.set_inputs.size() == 2);
+    TEST_REQUIRE(g_fake.appends.empty());
+}
+
+void TestAFailedStagedPrefillDropsOnlyItsSlot() {
+    auto engine = MakeSlotsEngine(2);
+    NewPrompt(*engine, {1, 2, 3});
+    NewPrompt(*engine, {4, 5});
+    std::vector<int> ids = engine->StagePromptImages("see <image>", {"PNG_FAKE"});
+    engine->clear_context();
+    g_fake.logits_width = kVocab + 1;
+    RequireThrows<std::runtime_error>([&] { engine->prefill(ids); });
+    g_fake.logits_width = kVocab;
+    TEST_REQUIRE(g_fake.generators_live == 1);
+    // the failed prefill left no image tokens behind, and no stage
+    TEST_REQUIRE(engine->get_current_context_length() == 0);
+    RequireState(NewPrompt(*engine, {4, 5, 6}), 3, 6, 15);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{6}));
+    TEST_REQUIRE(g_fake.generators_created == 3);
+    TEST_REQUIRE(g_fake.set_inputs.size() == 1);
+}
+
+void TestStagingImagesNamesAMissingProcessorEntry() {
+    auto symbols = FakeSymbols();
+    symbols.erase("OgaProcessorProcessImages");
+    auto engine = MakeEngineOn({0, 17, 0, 0}, std::move(symbols));
+    RequireContains(RequireThrows<std::runtime_error>([&] {
+                        engine->StagePromptImages("see <image>", {"PNG_FAKE"});
+                    }),
+                    "missing OgaProcessorProcessImages");
 }
 
 void TestOpenModelRejectsAModelOnAnotherDevice() {
@@ -2122,6 +2497,54 @@ void TestTheBackendRunsThePackagesImages() {
     TEST_REQUIRE(backend->replayed_tokens() == 0);
 }
 
+void TestGemma4UnifiedSharesThePresentBufferAndSkipsGraphCapture() {
+    g_fake = FakeOga{};
+    const auto api = FakeApi();
+    PackageDir package(kVocab, "<|im_end|>",
+                       R"(,"image_token_id":40,"vision":{"filename":"vision_encoder/model.onnx"})",
+                       "gemma4_unified");
+    TEST_REQUIRE(flm::oga::OpenModel(*api, package.dir.path) != nullptr);
+    TEST_REQUIRE(g_fake.overlays.size() == 2);
+    RequireContains(g_fake.overlays[1], R"("past_present_share_buffer":true)");
+    RequireContains(g_fake.overlays[1], R"("enable_graph_capture":"0")");
+    RequireContains(g_fake.overlays[1], R"("hip_graph_enable":"0")");
+    TEST_REQUIRE(g_fake.provider_options.size() == 6);
+    for (const char* key : {"profile", "enable_graph_capture", "hip_graph_enable"}) {
+        const auto matches = std::count_if(g_fake.provider_options.begin(), g_fake.provider_options.end(),
+                                            [&](const FakeOga::ProviderOption& option) {
+                                                return option.key == key;
+                                            });
+        TEST_REQUIRE(matches == 2);
+    }
+}
+
+void TestAnotherModelTypeDoesNotShareThePresentBuffer() {
+    g_fake = FakeOga{};
+    const auto api = FakeApi();
+    PackageDir package;
+    TEST_REQUIRE(flm::oga::OpenModel(*api, package.dir.path) != nullptr);
+    TEST_REQUIRE(g_fake.overlays.size() == 1);
+    TEST_REQUIRE(g_fake.provider_options.empty());
+}
+
+void TestTheGemma4UnifiedPackageStillRunsTextWithoutAVisionStartToken() {
+    g_fake = FakeOga{};
+    auto api = flm::oga::OgaApi::GetOrCreateWith([] { return FakeApi(); });
+    PackageDir package(kVocab, "<|im_end|>",
+                       R"(,"image_token_id":40,"vision":{"filename":"vision_encoder/model.onnx"})",
+                       "gemma4_unified");
+    auto backend = flm::oga::hipep_factory()(package.Context(64));
+    RequireContains(g_fake.overlays[1], R"("past_present_share_buffer":true)");
+    std::vector<int> text{1, 2};
+    backend->engine().prefill(text);
+    TEST_REQUIRE(g_fake.appends.back() == (Tokens{1, 2}));
+    const auto image = Image(2, 2);
+    flm::oga::OgaVisionInput vision{{image}};
+    std::vector<int> prompt = WithImage({1}, image, {2});
+    RequireContains(RequireThrows<std::invalid_argument>([&] { backend->engine().prefill(prompt, &vision); }),
+                    "does not run a vision payload");
+}
+
 void TestTheBackendRunsTheTextOfAnotherTypesVisionPackage() {
     g_fake = FakeOga{};
     auto api = flm::oga::OgaApi::GetOrCreateWith([] { return FakeApi(); });
@@ -2244,6 +2667,13 @@ int main(int argc, char** argv) {
     RUN(TestARefusedRewindReplaysInstead);
     RUN(TestARefusedRewindEndsTheRewinds);
     RUN(TestTheRewindEntryPointsAreOptional);
+    RUN(TestTwoConversationsTakingTurnsEachKeepTheirSlot);
+    RUN(TestTheLeastRecentlyUsedSlotIsRebuilt);
+    RUN(TestOneSlotKeepsOneGenerator);
+    RUN(TestTheSamePromptAgainRunsNothing);
+    RUN(TestAChunkedPromptReachesALongerSlot);
+    RUN(TestAnOgaErrorDropsOnlyItsSlot);
+    RUN(TestTheSlotCountFitsTheBudget);
     RUN(TestAnImagePromptRunsInOneSetInputsAfterAWarmUp);
     RUN(TestAnImageRunCanStartAChunk);
     RUN(TestANewImageReplaysTheHistoryWithEveryImage);
@@ -2262,6 +2692,15 @@ int main(int argc, char** argv) {
     RUN(TestARefusedRegistrationNamesTheLibrary);
     RUN(TestANonAsciiLibraryPathIsRefusedBeforeOgaSeesIt);
     RUN(TestOpenModelPutsTheDecoderOnTheRegisteredEpAlone);
+    RUN(TestGemma4UnifiedSharesThePresentBufferAndSkipsGraphCapture);
+    RUN(TestAnotherModelTypeDoesNotShareThePresentBuffer);
+    RUN(TestAStagedImagePromptIsTheNextPrefill);
+    RUN(TestADroppedOrRefusedStageDoesNotReachTheNextPrefill);
+    RUN(TestAStagedImagePromptTakesTheLeastRecentlyUsedSlot);
+    RUN(TestAStagedImagePromptAlwaysBuildsANewGenerator);
+    RUN(TestAFailedStagedPrefillDropsOnlyItsSlot);
+    RUN(TestStagingImagesNamesAMissingProcessorEntry);
+    RUN(TestTheGemma4UnifiedPackageStillRunsTextWithoutAVisionStartToken);
     RUN(TestOpenModelRejectsAModelOnAnotherDevice);
     RUN(TestDiscoveryReportsWhyEachRootIsRejected);
     RUN(TestDiscoveryAcceptsAVersionedPackageWithoutABinDirectory);

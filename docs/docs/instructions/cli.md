@@ -75,6 +75,11 @@ flm pull llama3.2:3b --force
 
 > ⚠️ Use `--force` **only if the model file is corrupted** (e.g., incomplete download). Proceed with caution.
 
+> 🔒 Downloads verify the server's TLS certificate. On Windows the system certificate store is used, so behind a corporate proxy that
+> inspects HTTPS, install the proxy's root certificate in Windows and downloads work as usual. If that is not possible,
+> `FLM_INSECURE_DOWNLOAD=1` turns verification off (insecure: anyone on the network path can see and alter the traffic;
+> model files are still checked against their SHA-256 hashes). A Hugging Face token is never sent without verification.
+
 > 📦 Some tags are built on another one: `nemotron3.5-bolt-dflash:e4b` adds a small draft package to the `nemotron3.5-bolt:e4b` weights.
 > `flm pull` downloads the base package first (from the same source, `--modelscope` included), `flm list` marks such a tag
 > "(requires ...)", and it is ready only when both packages are.
@@ -292,7 +297,8 @@ flm run  qwen3.5-oga-hipep:9b
 - **Models.** `qwen3.5-oga-hipep` (`9b`, `35b-a3b`, `122b-a10b`), `qwen3.6-oga-hipep` (`27b`, `35b-a3b`), `qwen3.8-oga-hipep:27b` and `qwen3.8-flash-next-oga-hipep:125b-a6b` take images as well as text. `qwen2.5-it-oga-hipep:14b`, `qwen2.5-coder-it-oga-hipep:14b`, `gemma3-oga-hipep:4b`, `gemma4-it-oga-hipep` (`12b`, `26b-a4b`) and `gpt-oss-oga-hipep:120b` take text only: the Gemma packages ship a vision model, and `gemma4-it-oga-hipep:12b` an audio model too, but FLM does not run them, so a request with an image or audio gets HTTP 400. The packages are 4 to 124 GB each.
 - **Images.** The images of one prompt share a budget of 8100 patches (one 1440x1440 image, 2025 image tokens), so a prompt with several images resizes each one smaller. The first image after the model loads takes a few seconds longer: FLM first runs the vision model once at that full size, so that every size after it gets correct image features (hip-ep 0.5.2 gave wrong ones without it).
 - **The host must have an NPU.** FLM still opens the NPU for this backend, so a host without an NPU is not supported yet.
-- **Conversation state.** Exact token prefixes continue the existing generator, so a request does not run its tokens twice. For Qwen3.5, Qwen3.6, Qwen3.8 and gpt-oss, FLM also keeps a checkpoint at the end of each prompt, as on the NPU: a follow-up turn whose prompt starts with the previous prompt rewinds the generator to that checkpoint and runs only the rest, even when the chat template leaves the reasoning of earlier replies out. onnxruntime-genai 0.19 cannot rewind the Gemma 4 packages, so with thinking on a Gemma 4 follow-up replays the conversation; FLM warns at the first refused rewind and does not try again. Any other history, and every new or changed image, replays the whole conversation (OGA takes images only when it starts a generator); `usage.prompt_tokens_details.cached_tokens` counts only the tokens that were not run again. NPU prefix slots are not used.
+- **Conversation state.** FLM keeps up to four conversations on the GPU, one OGA generator each, so that two chats, or an agent and its sub-agent, that take turns do not replay each other's history. A request goes to the generator holding the longest part of its prompt; with none, a new generator replays the whole prompt, in place of the least recently used one once all are in use. Exact token prefixes continue a generator, so a request does not run its tokens twice. For Qwen3.5, Qwen3.6, Qwen3.8 and gpt-oss, FLM also keeps a checkpoint at the end of each prompt, as on the NPU: a follow-up turn whose prompt starts with the previous prompt rewinds the generator to that checkpoint and runs only the rest, even when the chat template leaves the reasoning of earlier replies out, and the same prompt sent again (a retry, "regenerate") runs no prompt token at all. onnxruntime-genai 0.19 cannot rewind the Gemma 4 packages, so with thinking on a Gemma 4 follow-up replays the conversation; FLM warns at the first refused rewind and does not try again. Any other history, an edited earlier message, and every new or changed image replay the whole conversation (OGA takes images only when it starts a generator); `usage.prompt_tokens_details.cached_tokens` counts the tokens that were not run again.
+- **How many conversations.** `--prefix-slots N` sets how many generators to keep (default `4`, at most `32`; `0` keeps one, as before). Each holds the KV cache of the full context length: for `qwen3.5-oga-hipep:9b`, about 1.1 GiB at the default 32768 tokens and 4.1 GiB at 131072. The generators beyond the first must fit in `--prefix-cache-mb` (default `4096` MiB), so at a long `--ctx-len` FLM keeps fewer; the load log says how many (`OGA generators: up to N conversation(s) kept`). A new generator is made for each prompt that no kept one holds, and it stays until a later one replaces it, so after a few chats, edited messages or Gemma 4 thinking turns all of them hold their memory. On a machine with 32 GB or less, `--prefix-slots 2` or `--prefix-cache-mb 2048` leaves more for other programs.
 
 ---
 
@@ -407,7 +413,7 @@ flm serve qwen3.5:4b --prefix-cache-mb 8192 --prefix-slots 16
 | `--prefix-slots N` | `8` (at most `32`) | How many saved prompts to keep; `0` turns the prefix cache off |
 | `--prefix-min-gain N` | `128` | A new prompt is saved only if it is at least `N` tokens longer than a saved prompt that already covers it. Larger: fewer saves and evictions, but up to `N` more tokens re-read on a resume. `0`: save every prompt. See [Tuning `--prefix-min-gain`](https://fastflowlm.com/docs/instructions/server/prefix_cache/#tuning---prefix-min-gain) |
 
-`flm run` (CLI mode) does not use it. See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/) for memory per model, how to check that it works, and its limits.
+`flm run` (CLI mode) does not use it. On `-oga-hipep` models the same two options set how many conversations stay on the GPU (see [oga-hipep](#oga-hipep-oga-models-on-the-gpu), "How many conversations"). See [Prefix Cache (Prompt Reuse)](https://fastflowlm.com/docs/instructions/server/prefix_cache/) for memory per model, how to check that it works, and its limits.
 
 ---
 
@@ -437,7 +443,9 @@ flm run gemma3:4b --asr whisper-v3:turbo  # Load Whisper (whisper-large-v3-turbo
 flm serve gemma3:4b --asr whisper-v3:turbo  # Background-load Whisper and initialize the LLM (gemma3:4b) concurrently.
 ```
 
-> **Note:** ASR alone isn’t supported—an LLM must be present for end-to-end voice→text→LLM workflows.
+`--asr` also takes `r2t2:1.7b` (Confucius4-R2T2, Qwen3-ASR based) in server mode: `flm serve gemma3:4b --asr r2t2:1.7b`, or `flm serve --asr r2t2:1.7b` for speech-to-text only. See the [R2T2 page](https://fastflowlm.com/docs/models/r2t2/).
+
+> **Note:** In CLI mode (`flm run`) an LLM must be present for end-to-end voice→text→LLM workflows.
 
 See the ASR guide [here](https://fastflowlm.com/docs/models/whisper/)
 

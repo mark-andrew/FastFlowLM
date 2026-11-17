@@ -16,10 +16,12 @@
 #include "image/image_reader.hpp"
 #include "image/raw_rgb8.hpp"
 #include "base64.hpp"
+#include "utils/log_privacy.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include "AutoModel/modeling_minicpm_v.hpp"
+#include "AutoModel/modeling_qwen3_asr.hpp"
 #include "whisper/transcript_format.hpp"
 #include <sstream>
 #include <iostream>
@@ -842,6 +844,8 @@ bool RestHandler::is_known_model(const std::string& model_tag) {
 void RestHandler::ensure_asr_model_loaded(const std::string& model_tag) {
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
     std::string ensure_tag = model_tag;
+    const bool sidecar_r2t2 = this->supported_models.get_model_info(ensure_tag).second
+        .value("details", json::object()).value("family", std::string()) == "r2t2";
     switch (downloader.is_model_downloaded(ensure_tag, false, /*fast_check=*/true)) {
         case ModelDownloader::ModelStatus::Ready:
             break;
@@ -853,6 +857,23 @@ void RestHandler::ensure_asr_model_loaded(const std::string& model_tag) {
             header_print("ERROR", "Whisper is incompatible with this version of FastFlowLM, skipping... ");
             this->asr = false;
             return;
+    }
+    if (sidecar_r2t2) {
+        // r2t2 transcribes by itself: load it as a second engine beside the chat model
+        try {
+            auto [tag, engine] = get_auto_model(ensure_tag, this->supported_models, this->npu_device_inst);
+            auto [new_tag, info] = this->supported_models.get_model_info(tag);
+            engine->set_server_mode(true);
+            engine->load_model(this->supported_models.get_load_path(new_tag), info, -1, this->preemption, "");
+            engine->save_request_settings();
+            this->asr_sidecar_engine = std::move(engine);
+            this->asr_sidecar_tag = tag;
+        }
+        catch (const std::exception& e) {
+            header_print("ERROR", "Failed to load ASR model: " + std::string(e.what()));
+            exit(EXIT_FAILURE);
+        }
+        return;
     }
     this->whisper_engine = std::make_unique<Whisper>(this->npu_device_inst);
     auto [new_ensure_tag, whisper_model_info] = this->supported_models.get_model_info(ensure_tag);
@@ -2026,13 +2047,23 @@ void RestHandler::handle_openai_audio_transcriptions(const json& request,
                                         StreamResponseCallback send_streaming_response,
                                         std::shared_ptr<CancellationToken> cancellation_token) {
     try {
+        if (!request.contains("file") || !request["file"].is_string()) {
+            send_response({{"error", {{"message", "the request has no audio file (multipart field \"file\")"}, {"type", "invalid_request_error"}, {"code", 400}}}});
+            return;
+        }
         std::string model = request["model"];
         std::string file_content = request["file"].get<std::string>();
         std::vector<uint8_t> audio_raw(file_content.begin(), file_content.end());
         std::string language = request.value("language", "");
         std::string prompt = request.value("prompt", "");
         std::string response_format = request.value("response_format", "json");
-        bool stream = request.value("stream", false);
+        const std::string stream_field = request.contains("stream") && request["stream"].is_string() ? request["stream"].get<std::string>() : "";
+        const bool stream = request.contains("stream") && (request["stream"].is_boolean() ? request["stream"].get<bool>() : (stream_field == "true" || stream_field == "1"));
+        auto form_int = [&request](const char* key, int fallback) {
+            if (!request.contains(key)) return fallback;
+            if (request[key].is_number_integer()) return request[key].get<int>();
+            try { return std::stoi(request[key].get<std::string>()); } catch (...) { throw std::invalid_argument(std::string(key) + " must be an integer"); }
+        };
         json response;
         if (response_format != "json" && response_format != "text" && response_format != "verbose_json" &&
             response_format != "srt" && response_format != "vtt") {
@@ -2041,27 +2072,71 @@ void RestHandler::handle_openai_audio_transcriptions(const json& request,
         }
         // Segments need the timestamps; json and text are the same transcript without them.
         const bool timed = response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
-        if (this->asr) {
+        // A model that transcribes by itself (r2t2) answers when it is the one asked for; any other model name is served by
+        // the Whisper sidecar (--asr 1), as before.
+        Qwen3_ASR* self_asr = nullptr;
+        // --asr r2t2:...: the sidecar answers every transcription, so the chat model stays loaded
+        if (this->asr_sidecar_engine) {
+            self_asr = dynamic_cast<Qwen3_ASR*>(this->asr_sidecar_engine.get());
+        } else if (!model.empty() && supported_models.is_model_supported(supported_models.rectify_model_tag(model))) {
+            auto [asr_tag, asr_info] = this->supported_models.get_model_info(model);
+            if (asr_info.contains("details") && asr_info["details"].value("family", "") == "r2t2") {
+                if (!ensure_model_loaded(model)) throw std::runtime_error("failed to load " + model);
+                self_asr = dynamic_cast<Qwen3_ASR*>(this->auto_chat_engine.get());
+            }
+        }
+        std::string audio_context;
+        std::string language_name;
+        double duration = 0.0;
+        if (this->asr || self_asr) {
+            // Transcripts are user speech: log them only when FLM_LOG_CONTENT or FLM_LOG_RAW_OUTPUT asks.
+            const bool log_transcript = flm::log_privacy::raw_output_enabled();
+            std::ostream no_log(nullptr);
+            std::ostream& transcript_log = log_transcript ? std::cout : no_log;
+            if (self_asr && stream) {
+                // Append-only text as the audio is processed chunk by chunk (OpenAI transcription events): the model's streaming mode on a whole file
+                header_print("FLM", "Transforming audio to text, streaming (" << model << ")...");
+                chat_meta_info_t asr_meta;
+                asr_meta.max_prefill_len = this->prefill_chunk_len;
+                cancellation_token->reset();
+                auto sse = [&send_streaming_response](const json& event, bool final) { send_streaming_response(json("data: " + event.dump() + "\n\n"), final); };
+                const int chunk_ms = form_int("chunk_size_ms", 1000);
+                const int lookahead_ms = form_int("lookahead_ms", 160);
+                const int unfixed = form_int("unfixed_token_num", 1);
+                try {
+                    audio_context = self_asr->transcribe_streaming(asr_meta, audio_raw, language, prompt, chunk_ms, lookahead_ms, unfixed,
+                        [&sse](const std::string& delta) { sse({{"type", "transcript.text.delta"}, {"delta", delta}}, false); },
+                        language_name, duration, [&] { return cancellation_token->cancelled(); });
+                } catch (const std::invalid_argument& e) {
+                    send_response({{"error", {{"message", e.what()}, {"type", "invalid_request_error"}, {"code", 400}}}});
+                    return;
+                }
+                sse({{"type", "transcript.text.done"}, {"text", audio_context}}, false);
+                send_streaming_response(json("data: [DONE]\n\n"), true);
+                return;
+            }
+            if (self_asr) {
+                header_print("FLM", "Transforming audio to text (" << model << ")...");
+                chat_meta_info_t asr_meta;
+                asr_meta.max_prefill_len = this->prefill_chunk_len;
+                transcript_log << "Audio content: " << std::flush;
+                audio_context = self_asr->transcribe(asr_meta, audio_raw, language, prompt, request.value("max_tokens", 8192), transcript_log,
+                                                     language_name, duration, [&] { return cancellation_token->cancelled(); });
+                transcript_log << std::endl;
+            } else {
 #ifndef FASTFLOWLM_LINUX_LIMITED_MODELS
             this->whisper_engine->load_audio(audio_raw);
             header_print("FLM", "Transforming audio to text...");
-            // Transcripts are user speech: log them only when FLM_LOG_RAW_OUTPUT asks.
-            const char* log_env = std::getenv("FLM_LOG_RAW_OUTPUT");
-            const bool log_transcript = log_env != nullptr && log_env[0] != '\0' && std::strcmp(log_env, "0") != 0;
-            std::ostream no_log(nullptr);
-            std::ostream& transcript_log = log_transcript ? std::cout : no_log;
             transcript_log << "Audio content: " << std::flush;
             std::pair<std::string, std::string> audio_result = this->whisper_engine->generate(Whisper::whisper_task_type_t::e_transcribe, true, timed, transcript_log, language, prompt);
-            std::string audio_context = audio_result.first;
-            std::string language_name = audio_result.second;
-            double duration = this->whisper_engine->audio_duration();
+            audio_context = audio_result.first;
+            language_name = audio_result.second;
+            duration = this->whisper_engine->audio_duration();
             transcript_log << std::endl;
 #else
             throw std::runtime_error("ASR models are not supported in this build");
-            std::string audio_context;
-            std::string language_name;
-            double duration = 0.0;
 #endif
+            }
 
             if (response_format == "json") {
                 response = {

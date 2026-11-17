@@ -22,6 +22,7 @@
 #include <optional>
 #include <stdexcept>
 #include "typedef.hpp"
+#include "utils/log_privacy.hpp"
 #include "image/raw_rgb8.hpp"
 #include "causal_lm.hpp"
 #include "prefix_slot_cache.hpp"
@@ -192,20 +193,19 @@ protected:
 	std::unique_ptr<npu_xclbin_manager> npu;
 	bool enable_preemption = false;
     std::vector<int> checkpoint_his;
-	/// \brief dump the undecorated model output to stdout once a turn ends
-	/// \note on by default; models whose turns are short and driven in bulk (the
-	///       hunyuan translator) turn it off so the log is not doubled. Those
-	///       models should seed this from env_forces_raw_output() so diagnostics
-	///       can opt back in without changing the interactive default.
-	bool log_raw_output = true;
-	/// \brief whether FLM_LOG_RAW_OUTPUT forces the "Model RAW Output:" dump on
-	/// \note the qualification harness and numerical-match anchor per-turn parsing
-	///       on that marker, so they set FLM_LOG_RAW_OUTPUT=1 to re-enable it for
-	///       models that quiet it by default; unset/empty/"0" leave the default.
+	/// \brief dump the undecorated model output to stdout once a turn ends (print_raw_output)
+	/// \note off by default: the reply is user content and stays out of the log
+	///       (utils/log_privacy.hpp). FLM_LOG_CONTENT=1 or FLM_LOG_RAW_OUTPUT=1 turn
+	///       it on for every model; the qualification harness and numerical-match
+	///       anchor per-turn parsing on the "Model RAW Output:" marker and set
+	///       FLM_LOG_RAW_OUTPUT=1.
+	bool log_raw_output = flm::log_privacy::raw_output_enabled();
+	/// \brief whether FLM_LOG_CONTENT or FLM_LOG_RAW_OUTPUT asks for the "Model RAW Output:" dump
 	static bool env_forces_raw_output() {
-		const char* value = std::getenv("FLM_LOG_RAW_OUTPUT");
-		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+		return flm::log_privacy::raw_output_enabled();
 	}
+	/// \brief print "Model RAW Output:" and `result` when log_raw_output is on; the only place that prints it
+	void print_raw_output(const std::string& result) const;
 	/// \brief run one more forward on the eos token once a turn ends
 	/// \note this keeps the kv cache aligned with token_history so a following
 	///       turn can append to it. Models that rewind or clear between turns
@@ -435,6 +435,21 @@ protected:
 	/// \param meta_info the request, carrying the constraint
 	/// \return the sampled token, already reported to the constraint
 	int _sample(buffer<bf16>& logits, chat_meta_info_t& meta_info);
+
+	/// \brief _sample() for one verify row of a speculative batch
+	/// \param row the row's vocab fp32 logits
+	/// \param ahead tokens of the batch committed before this row, not yet in meta_info.generated_tokens
+	/// \param greedy take the row's plain argmax inside the masks (no penalties, no penalty window) instead of a draw
+	/// \return the token, already reported to the constraint; no logprob is recorded
+	/// \note Same constraint mask, ignore_eos / min_tokens EOS mask and fallback as _sample().
+	int _sample_row(const float* row, int vocab, chat_meta_info_t& meta_info, int ahead, bool greedy);
+
+	/// \brief The masks, draw, fallback and constraint step _sample() and _sample_row() share
+	/// \param at the logit of id i, read only by the fallback
+	/// \param draw (mask or nullptr, raw) -> the sampler's token
+	template <typename At, typename Draw>
+	int _sample_masked(std::size_t n, At at, Draw draw, chat_meta_info_t& meta_info, bool no_eos,
+	                   sample_logprobs_t* raw);
 
 	/// \brief Add a token's entry to meta_info.logprobs
 	/// \param token_logit the token's raw logit
@@ -707,6 +722,11 @@ public:
 	virtual bool manages_prefix_cache() const {
 		return this->prefix_cache_.enabled() ||
 		       (this->backend_ && this->backend_->matches_token_prefixes());
+	}
+
+	/// \brief the model transcribes whole audio files itself (/v1/audio/transcriptions), without the Whisper sidecar
+	virtual bool supports_transcription() const {
+		return false;
 	}
 
 	/// \brief --prefix-cache-mb / --prefix-slots / --prefix-min-gain (-1 = the default, 0 slots = off); call before load_model

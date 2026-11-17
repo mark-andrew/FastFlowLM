@@ -16,6 +16,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -37,6 +38,12 @@ std::string Text(const std::filesystem::path& path) {
 /// \brief no CPU fallback for the decoder
 constexpr const char* kSessionOverlay =
     R"({"model":{"decoder":{"session_options":{"session.disable_cpu_ep_fallback":"1"}}}})";
+
+/// \brief gemma4_unified keeps the preallocated present buffer and does not capture a graph.
+/// \note With past_present_share_buffer the present OrtValue is allocated to max_length.
+///       A captured graph is baked for one sequence length, so capture stays off.
+constexpr const char* kGemmaSearchOverlay =
+    R"({"model":{"decoder":{"session_options":{"provider_options":[{"AMDGPU":{"profile":"hip","enable_graph_capture":"0","hip_graph_enable":"0"}}]}}},"search":{"past_present_share_buffer":true}})";
 
 nlohmann::json ReadJson(const std::filesystem::path& path) {
     flm::file_access::ObserveOpen(path);
@@ -88,12 +95,17 @@ struct GenaiConfig {
     /// \brief whether a text prompt needs a batch of one image without pixels (OgaEngine)
     /// \note gemma3 packages take 3-D image_features, [images, tokens, hidden]
     bool empty_image_batch = false;
+    /// \brief model.decoder's layer count, KV heads and head size, 0 when it does not state them
+    std::uint64_t layers = 0;
+    std::uint64_t kv_heads = 0;
+    std::uint64_t head_size = 0;
 };
 
 /// \brief whether the engine runs the vision model of a package of this model type
 /// \note The engine feeds OGA the inputs of its Qwen3.5 vision pipeline (pixel_values per
 ///       patch, image_grid_thw, num_image_tokens). A package of another type that ships a
-///       vision model, such as gemma3 or gemma4, runs text only.
+///       vision model, such as gemma3 or gemma4, runs text on that pipeline. gemma4_unified
+///       images go through the package processor (OgaEngine::StagePromptImages) instead.
 bool RunsVisionOf(const std::string& type) {
     return type == "qwen3_5" || type == "qwen3_5_moe";
 }
@@ -116,6 +128,11 @@ GenaiConfig ReadGenaiConfig(const std::filesystem::path& root) {
     if (out.type.empty() || !out.vocab_size || !out.context_length)
         throw std::runtime_error(Text(file) +
                                  " must state model.type, vocab_size and context_length");
+    if (const auto decoder = model->find("decoder"); decoder != model->end() && decoder->is_object()) {
+        out.layers = cfg_get<std::uint64_t>(*decoder, "num_hidden_layers", 0);
+        out.kv_heads = cfg_get<std::uint64_t>(*decoder, "num_key_value_heads", 0);
+        out.head_size = cfg_get<std::uint64_t>(*decoder, "head_size", 0);
+    }
     const auto vision = model->find("vision");
     out.empty_image_batch = out.type == "gemma3" && vision != model->end() && vision->is_object();
     if (vision != model->end() && vision->is_object() && RunsVisionOf(out.type)) {
@@ -141,6 +158,59 @@ std::int64_t PatchValues(const nlohmann::json& vision_config) {
            cfg_get<std::int64_t>(vision_config, "temporal_patch_size", 1) * patch * patch;
 }
 
+/// \brief whether genai_config.json names a gemma4_unified package
+/// \note A missing or unreadable file is not that package. OpenModel is also called
+///       on paths that have no package yet.
+bool IsGemma4Unified(const std::filesystem::path& root) {
+    try {
+        const auto genai = ReadJson(root / "genai_config.json");
+        const auto model = genai.find("model");
+        return model != genai.end() && model->is_object() &&
+               model->value("type", std::string()) == "gemma4_unified";
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+/// \brief generators kept by default (--prefix-slots -1), and the most it takes
+constexpr std::size_t kDefaultSlots = 4;
+constexpr std::size_t kMostSlots = 32;
+/// \brief MiB the generators beyond the first may take by default (--prefix-cache-mb -1)
+constexpr std::uint64_t kDefaultSlotBudgetMb = 4096;
+
+/// \brief the KV bytes a generator holds per position: K and V, 16-bit, in every layer but
+///        the linear-attention ones (config.json's layer_types)
+/// \return 0 when genai_config.json does not state the decoder's shape
+/// \note The recurrent state of a linear-attention layer does not grow with the length.
+///       Sliding-window layers count in full, so the estimate errs high, never low.
+std::uint64_t BytesPerPosition(const GenaiConfig& genai, const LM_Config& config) {
+    if (!genai.layers || !genai.kv_heads || !genai.head_size) return 0;
+    std::uint64_t layers = genai.layers;
+    auto types = config.get<nlohmann::json>("layer_types", nlohmann::json());
+    if (!types.is_array())  // Qwen3.5 states it under text_config
+        types = cfg_get<nlohmann::json>(config.sub("text_config"), "layer_types", nlohmann::json());
+    if (types.is_array() && types.size() == genai.layers)
+        layers -= static_cast<std::uint64_t>(std::count_if(types.begin(), types.end(), [](const nlohmann::json& type) {
+            return type.is_string() && type.get<std::string>() == "linear_attention";
+        }));
+    return layers * genai.kv_heads * genai.head_size * 2 * 2;
+}
+
+/// \brief the slot limits --prefix-slots and --prefix-cache-mb ask for
+OgaSlotLimits SlotLimits(const flm::backend::BackendContext& context, std::uint64_t bytes_per_position) {
+    OgaSlotLimits limits;
+    limits.count = context.prefix_slots < 0 ? kDefaultSlots
+                                            : std::min<std::size_t>(context.prefix_slots, kMostSlots);
+    const std::uint64_t mb = context.prefix_cache_mb < 0
+                                 ? kDefaultSlotBudgetMb
+                                 : static_cast<std::uint64_t>(context.prefix_cache_mb);
+    limits.budget_bytes = mb << 20;
+    limits.bytes_per_position = bytes_per_position;
+    // Without the size per position the budget cannot be checked, so keep only one.
+    if (!bytes_per_position) limits.count = std::min<std::size_t>(limits.count, 1);
+    return limits;
+}
+
 }  // namespace
 
 OgaApi::Owned<OgaModel> OpenModel(const OgaApi& api, const std::filesystem::path& root) {
@@ -153,6 +223,19 @@ OgaApi::Owned<OgaModel> OpenModel(const OgaApi& api, const std::filesystem::path
     api.Check(f.config_clear_providers(config.get()), "OgaConfigClearProviders");
     api.Check(f.config_append_provider(config.get(), kAmdGpuProviderName), "OgaConfigAppendProvider");
     api.Check(f.config_overlay(config.get(), kSessionOverlay), "OgaConfigOverlay");
+    if (IsGemma4Unified(root)) {
+        // ClearProviders drops the package's AMDGPU options. This export's KV
+        // grows by concatenation, which graph capture rejects, so capture stays off.
+        for (const char* provider : {"AMDGPU", kAmdGpuProviderName}) {
+            api.Check(f.config_set_provider_option(config.get(), provider, "profile", "hip"),
+                      "OgaConfigSetProviderOption");
+            api.Check(f.config_set_provider_option(config.get(), provider, "enable_graph_capture", "0"),
+                      "OgaConfigSetProviderOption");
+            api.Check(f.config_set_provider_option(config.get(), provider, "hip_graph_enable", "0"),
+                      "OgaConfigSetProviderOption");
+        }
+        api.Check(f.config_overlay(config.get(), kGemmaSearchOverlay), "OgaConfigOverlay");
+    }
     OgaModel* raw_model = nullptr;
     api.Check(f.create_model_from_config(config.get(), &raw_model), "OgaCreateModelFromConfig");
     OgaApi::Owned<OgaModel> model(raw_model, {f.destroy_model});
@@ -216,9 +299,22 @@ public:
         api_ = OgaApi::GetOrCreate();
         auto model = OpenModel(*api_, root);
         header_print("FLM", "OGA device: AMDGPU (" << Text(api_->package().bin) << ")");
+        const std::uint64_t per_position = BytesPerPosition(genai, *context.config);
+        const OgaSlotLimits limits = SlotLimits(context, per_position);
         engine_ = std::make_unique<OgaEngine>(api_, std::move(model), name, genai.vocab_size,
                                               genai.context_length, length, genai.vision,
-                                              genai.empty_image_batch);
+                                              genai.empty_image_batch, limits);
+        const std::size_t slots = engine_->slot_limit();
+        std::ostringstream text;
+        text << "OGA generators: up to " << slots << " conversation(s) kept";
+        if (per_position)
+            text << ", " << ((per_position * length) >> 20) << " MiB each at " << length << " positions";
+        else
+            text << " (genai_config.json states no decoder shape, so the size of one is unknown)";
+        if (slots < std::max<std::size_t>(limits.count, 1))
+            text << " (--prefix-slots asks for " << limits.count << "; the ones beyond the first must fit in "
+                 << (limits.budget_bytes >> 20) << " MiB, --prefix-cache-mb)";
+        header_print("FLM", text.str());
     }
 
     causal_lm& engine() override { return *engine_; }
@@ -233,6 +329,8 @@ public:
     bool forwards_past_eos() const override { return false; }
     bool keeps_state_on_restore() const override { return engine_->rewinds(); }
     std::uint64_t replayed_tokens() const override { return engine_->replayed_tokens(); }
+    std::uint64_t reused_tokens() const override { return engine_->reused_tokens(); }
+    void expect_prefill(const std::vector<int>& tokens) override { engine_->expect_prefill(tokens); }
     bool matches_token_prefixes() const override { return true; }
     std::optional<std::vector<int>> forced_eos_ids() const override { return eos_ids_; }
     std::optional<int> forced_bos_id() const override { return bos_id_; }

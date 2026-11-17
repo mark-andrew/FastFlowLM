@@ -38,9 +38,9 @@ flm serve lfm2:1.2b -e embed-gemma:300m
 flm serve lfm2:1.2b -a whisper-v3:turbo
 ```
 
-Each loaded model holds NPU hardware contexts, and the driver allows only 16 per NPU device. An LLM together with **both** Whisper and the embedding model can exceed that limit, in which case the LLM fails to load (`DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed`). If that happens, load at most one of `-a` / `-e` next to the LLM, or use separate server processes as shown below.
+Each loaded model holds NPU hardware contexts, and the driver allows only 16 per NPU device. An LLM together with **both** Whisper and the embedding model can exceed that limit, in which case the model that loads last fails (`DRM_IOCTL_AMDXDNA_CREATE_HWCTX IOCTL failed`). If that happens, load at most one of Whisper / the embedding model next to the LLM, or use separate server processes as shown below. Leaving out `-e` does not keep the embedding model off the NPU: a `/v1/embeddings` request loads the embedding model it names whether or not `-e` was given.
 
-`-a` / `-e` take a model tag; `-a 1` / `-e 1` still select the default ASR (`whisper-v3:turbo`) / embedding (`embed-gemma:300m`) model.
+`-a` / `-e` take a model tag; `-a 1` / `-e 1` still select the default ASR (`whisper-v3:turbo`) / embedding (`embed-gemma:300m`) model. `-e` only preloads the embedding model at startup.
 
 ### Run model types in separate server processes (different ports)
 
@@ -172,3 +172,24 @@ flm serve --quiet
 ```
 
 This keeps the parent application's logs cleaner and easier to read.
+
+## What the Server Log Shows
+
+By default the log keeps no text a user sent or a model wrote. Each request is logged with its route (without the URL query), its time and one line that sums up its JSON body: the top-level parameters only. The model tag, numbers and flags are shown; a text is its length, a list its item count, an object its key count. Nothing inside `messages`, `tools` or a schema is shown. The reply text is not dumped either.
+
+```
+[LOG]  Body (412 bytes; FLM_LOG_CONTENT=1 shows the text): {"max_tokens":64,"messages":"<3 items>","model":"llama3.2:1b","stream":true}
+```
+
+For troubleshooting, turn content back on before starting FLM (the switches are read when the server starts):
+
+| Environment variable | Logs |
+|---|---|
+| `FLM_LOG_CONTENT=1` | request bodies with their text (message text cut to its first and last 10 characters, other long strings such as images to their ends), the `Model RAW Output:` dump of each reply, ASR transcripts |
+| `FLM_LOG_RAW_OUTPUT=1` | only the `Model RAW Output:` dump and ASR transcripts, for every model (scripts that parse each turn on that marker set this) |
+
+```powershell
+$env:FLM_LOG_CONTENT = "1"; flm serve llama3.2:1b
+```
+
+> 🔒 Leave these off on a shared machine or a server others use: the log then holds their prompts and answers. The same switches apply to `flm run`.
